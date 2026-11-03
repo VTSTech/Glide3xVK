@@ -1,0 +1,1094 @@
+#include "g3x_frame.h"
+#include "g3x_log.h"
+#include "vk_backend.h"
+#include "g3x_overlay.h"
+#include "g3x_slang.h"
+#include "g3x_shot.h"
+#include "g3x_raster_core.h"
+#include "g3x_raster_gpu.h"
+
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <new>
+
+// Game-side dims convention (D2Glide/Renderer/Glide.cpp
+// RENDERER_GLIDE_CalculateTextureSize + the real glide.h aspect encoding:
+// GR_ASPECT_LOG2_8x1=3 .. 2x1=1 wide, 1x2=-1 .. 1x8=-3 tall): the max
+// dimension is 2^lod, the other is 2^(lod-|aspect|).
+void g3x_tex_dims(unsigned lod, int aspect, unsigned* w, unsigned* h) {
+    if (lod > 11) lod = 11;
+    if (aspect > 3) aspect = 3;
+    if (aspect < -3) aspect = -3;
+    if (aspect >= 0) {
+        *w = 1u << lod;
+        *h = 1u << (lod - (aspect > (int)lod ? (int)lod : aspect));
+    } else {
+        *w = 1u << (lod + (-aspect > (int)lod ? -(int)lod : aspect));
+        *h = 1u << lod;
+    }
+}
+
+namespace {
+
+// ---- frame ----------------------------------------------------------------
+uint32_t* s_px = nullptr;            // ARGB dwords (LE bytes = B,G,R,A)
+unsigned  s_w = 0, s_h = 0;
+
+// ---- state ----------------------------------------------------------------
+uint32_t s_palette[256] = {};        // ARGB dwords as downloaded
+unsigned s_palette_epoch = 0;        // bumped on every palette download
+unsigned s_chroma_mode = 0;
+unsigned s_chroma_value = 0;
+bool     s_chroma_on = false;
+unsigned s_chroma_toggles = 0;       // P2.8: grChromakeyMode/value changes
+unsigned s_blend_sf = 4, s_blend_df = 0;   // GR_BLEND rgb pair; default ONE,ZERO
+uint32_t s_constant = 0xFFu;         // grConstantColorValue, raw as passed
+unsigned s_const_alpha = 0xFFu;      // game packs the blend alpha in bits 7..0
+bool     s_color_fill = false;       // colorCombine mode 2 = constant fill
+uint8_t  s_gamma_lut[3][256];        // per channel; identity until set_gamma
+bool     s_gamma_identity = true;
+
+// Route-B Stage 0: the fill-source decode, the five blend classes and all
+// the raster math now live in g3x_raster_core.h — a host-agnostic header the
+// compute kernel (spike/routeb.comp) mirrors expression-for-expression. This
+// TU keeps the STATE (palette, chroma, blend pair, texture cache) and feeds
+// the core through FrameHost below; behavior is pinned byte-identical by
+// spike/raster_regress (CPU pin) — see ROUTE-B.md §4/§6.
+g3xrc::BlendClass s_blend_class = g3xrc::BC_OPAQUE;
+
+static void blend_reclass() {
+    s_blend_class = g3xrc::blend_class_of(s_blend_sf, s_blend_df);
+}
+
+// ---- chroma ---------------------------------------------------------------
+// P2.9 ROOT-CAUSE FIX (round-11 field evidence: in-game black rects around
+// every sprite/wall tile + solid black bars behind the menu button labels):
+// the old rule (post-palette RGB == chroma key) never fired — the game sets
+// grChromakeyValue(0xff) = pure blue while EVERY downloaded palette carries
+// pal[0] = 0xff000000 black, so hit[] stayed all-zero and every DC6 sprite's
+// transparent texels painted black.
+// The D2 ground truth (D2CMP/SRC/FastCmp.cpp FASTCMP_DecompressRLE +
+// RENDERER_GLIDE_UploadTextureToCache): DC6 RLE transparent runs are SKIPPED
+// over a memset-0 upload buffer, so the transparent texel is palette INDEX 0
+// in every sprite and tile texture (index 1 is the darkest art color; 0 is
+// reserved). Real hardware punched those texels — so the working chroma rule
+// is: discard texel when its index is 0, or when its post-palette RGB equals
+// the key (kept for completeness).
+uint8_t s_chroma_hit[256];
+bool    s_chroma_dirty = true;
+
+// Route-B Stage 1 record sink pointer (see g3x_frame.h). Declared before the
+// state it feeds; null by default so every emission is a cold null-check.
+const G3xRouteBSink* s_routeb = nullptr;
+// Route-B Stage 2 (raster=gpu): when on, the dispatcher emits the primitive
+// stream WITHOUT running the CPU raster — the kernel reproduces it
+// bit-exactly (ROUTE-B.md §6/§7). Emissions and their order are untouched.
+bool s_gpu_emit = false;
+unsigned s_chroma_ver = 0;      // chroma content version (bumped per rebuild)
+
+inline void chroma_sync() {
+    if (!s_chroma_dirty) return;
+    const uint32_t key = s_chroma_value & 0x00FFFFFFu;
+    for (int i = 0; i < 256; ++i)
+        s_chroma_hit[i] = (uint8_t)((s_palette[i] & 0x00FFFFFFu) == key);
+    s_chroma_hit[0] = 1;   // P2.9: the DC6 transparent index
+    ++s_chroma_ver;
+    if (s_routeb && s_routeb->table_chroma)
+        s_routeb->table_chroma(s_routeb->ud, s_chroma_ver, s_chroma_hit);
+    s_chroma_dirty = false;
+}
+
+// ---- vertex-color-multiplied palette cache --------------------------------
+// Ground/UI draws repeat one vertex color across a whole tile/sprite; the
+// texel*color multiply then collapses to one LUT load per pixel.
+uint32_t s_pal_mult[256];
+uint32_t s_pal_mult_vc = 0xFFFFFFFFu;      // vc RGB the table was built for
+unsigned s_pal_mult_epoch = 0xFFFFFFFFu;
+
+void pal_mult_build(uint32_t vc) {
+    const unsigned vr = vc & 0xFFu, vg = (vc >> 8) & 0xFFu, vb = (vc >> 16) & 0xFFu;
+    for (int i = 0; i < 256; ++i) {
+        const uint32_t p = s_palette[i];
+        s_pal_mult[i] = 0xFF000000u
+            | ((((p & 0xFFu) * vr + 255u) >> 8))
+            | ((((p >> 8) & 0xFFu) * vg + 255u) >> 8) << 8
+            | ((((p >> 16) & 0xFFu) * vb + 255u) >> 8) << 16;
+    }
+    s_pal_mult_vc = vc;
+    s_pal_mult_epoch = s_palette_epoch;
+}
+
+// ---- textures -------------------------------------------------------------
+struct Tex {
+    uint8_t* data;                   // our own copy (base lod first)
+    unsigned w, h;                   // texel dims of the base (large) lod
+    unsigned lod;                    // largeLodLog2 — the 2^lod coord space
+    unsigned bpp;                    // 1 for P_8
+    unsigned ver;                    // Route-B: content version (bumped per
+                                     // re-download — mid-frame rebind storms
+                                     // snapshot per primitive through it)
+    bool     used;
+};
+constexpr unsigned kMaxTex = 8192;   // in-game tile churn needs headroom (943+ dl/round-5;
+                                     // 4096 risked mid-session exhaustion -> stale binds)
+Tex         s_tex[kMaxTex];
+unsigned    s_keys[kMaxTex];         // (tmu<<28) | (addr & 0x0FFFFFFF)
+unsigned    s_tex_used_hwm = 0;      // P2.8: high-water of live slots
+unsigned    s_tex_dropped_total = 0; // P2.8: downloads rejected (table full)
+int         s_cur = -1;              // bound texture slot (grTexSource)
+
+bool s_warned_tex_full = false;
+
+unsigned tex_key(unsigned tmu, unsigned addr) {
+    return (tmu << 28) | (addr & 0x0FFFFFFFu);
+}
+
+unsigned tex_bytes_per_pixel(unsigned fmt) {
+    // GR_TEXFMT_P_8 (5) and the other 8bpp formats are 1 byte; the rest 2.
+    return (fmt == 0x5u || fmt <= 0x3u) ? 1u : 2u;
+}
+
+// P2.12 perf: key -> slot+1 open-addressing hash. g3x_frame_tex_source was a
+// linear scan over up to kMaxTex slots per bind and tex_slot_alloc rescanned
+// from 0 on every download — with the in-game table at several thousand live
+// slots and hundreds of binds+downloads per frame that was real per-frame CPU
+// (the round-14 field log shows ~500 draws/frame with continuous tile churn).
+// Slots are never freed (no glide call releases one), so the table is
+// insert-only and a monotonic allocation cursor preserves the exact
+// first-free slot order of the old scan while making it O(1) amortized.
+constexpr unsigned kTexHashBits = 14;                 // 16384 > 2*kMaxTex
+constexpr unsigned kTexHashSize = 1u << kTexHashBits;
+unsigned s_tex_hash[kTexHashSize] = {};               // 0 = empty; else slot+1
+unsigned s_tex_alloc_cursor = 0;                      // first possibly-free slot
+
+unsigned tex_hash(unsigned key) {
+    return (key * 2654435761u) >> (32 - kTexHashBits);
+}
+
+int tex_slot_find(unsigned key) {
+    unsigned h = tex_hash(key);
+    for (;;) {
+        const unsigned v = s_tex_hash[h];
+        if (!v) return -1;
+        const int slot = (int)v - 1;
+        if (s_keys[slot] == key && s_tex[slot].used) return slot;
+        h = (h + 1) & (kTexHashSize - 1);
+    }
+}
+
+int tex_slot_alloc(unsigned key) {
+    const int found = tex_slot_find(key);
+    if (found >= 0) return found;
+    while (s_tex_alloc_cursor < kMaxTex && s_tex[s_tex_alloc_cursor].used)
+        ++s_tex_alloc_cursor;
+    if (s_tex_alloc_cursor >= kMaxTex) return -1;
+    return (int)s_tex_alloc_cursor;
+}
+
+// Insert a freshly allocated slot's key. No-op when the key is already in the
+// table (re-download of a live texture through the tex_slot_find fast path).
+void tex_hash_insert(unsigned key, int slot) {
+    unsigned h = tex_hash(key);
+    for (;;) {
+        const unsigned v = s_tex_hash[h];
+        if (!v) { s_tex_hash[h] = (unsigned)slot + 1; return; }
+        const int s = (int)v - 1;
+        if (s_keys[s] == key && s_tex[s].used) return;
+        h = (h + 1) & (kTexHashSize - 1);
+    }
+}
+
+unsigned s_tex_miss_total = 0;       // exit-summary diagnostic (round 6)
+
+// P2.4 draw-path counters (surfaced via g3x_frame_draw_stats for the periodic
+// frame lines — with per-call tags budget-quiet, these are the only window
+// into what a gameplay session actually submits). Declared before the raster
+// section: fill_rect_fast bumps s_n_fill (P2.7 fill diagnostic).
+static unsigned s_n_vac = 0;          // grDrawVertexArrayContiguous fans
+static unsigned s_n_parr = 0;         // grDrawVertexArray pointer-array draws
+static unsigned s_n_parr_strip = 0;
+static unsigned s_n_parr_fan = 0;
+static unsigned s_n_skip_notex = 0;   // draws dropped: no texture bound
+static unsigned s_n_space256 = 0;     // draws on sub-256-mip textures (P2.7:
+                                      // the class the square-space scale fixes)
+static unsigned s_n_rgb565 = 0;       // draws sampled from RGB_565 textures (P2.6)
+static unsigned s_n_fill = 0;         // constant-fill quads (axis-aligned fast path)
+static unsigned s_n_vc0 = 0;          // P2.8: textured quads with (near-)uniform
+                                      // BLACK vertex color — the shadow/darken
+                                      // class; opaque-black rects unless chroma
+                                      // punches their transparent texels
+
+// ---- raster (math in g3x_raster_core.h; this TU keeps state + conversion) --
+using RVert    = g3xrc::RVert;
+using TexSpace = g3xrc::TexSpace;
+
+// The Host adapter: exposes the frame module's statics under the core's
+// contract (g3x_raster_core.h header comment). Zero behavior — accessors only.
+struct FrameHost {
+    unsigned width() const        { return s_w; }
+    unsigned height() const       { return s_h; }
+    uint32_t* px() const          { return s_px; }
+    uint32_t constant() const     { return s_constant; }
+    unsigned const_alpha() const  { return s_const_alpha; }
+    bool color_fill() const       { return s_color_fill; }
+    unsigned blend_sf() const     { return s_blend_sf; }
+    unsigned blend_df() const     { return s_blend_df; }
+    g3xrc::BlendClass blend_class() const { return s_blend_class; }
+    bool chroma_on() const        { return s_chroma_on; }
+    const uint8_t* chroma_hit() const { return s_chroma_hit; }
+    const uint32_t* palette() const   { return s_palette; }
+    const uint32_t* pal_mult() const  { return s_pal_mult; }
+    void ensure_pal_mult(uint32_t vc) {
+        if (s_pal_mult_epoch != s_palette_epoch || s_pal_mult_vc != vc)
+            pal_mult_build(vc);
+    }
+    bool has_tex() const          { return s_cur >= 0; }
+    g3xrc::TexView tex_view() const {
+        const Tex& t = s_tex[s_cur];
+        return g3xrc::TexView{ t.data, t.w, t.h, t.lod, t.bpp };
+    }
+};
+static FrameHost& g3xrc_host() { static FrameHost h; return h; }
+
+// ---- Route-B Stage 1 record sink (see g3x_frame.h) -------------------------
+// s_routeb / s_chroma_ver live above chroma_sync (first use). The emitters
+// below stamp primitives with the dispatcher's live state.
+// (g3x_frame_routeb_sink itself is defined at file scope below the anon
+// namespace — the header declares it with external linkage.)
+
+static void rb_pack20(uint32_t* dst, const RVert& v) {
+    std::memcpy(dst, &v, 20);   // RVert is exactly {x,y,u,v,argb}, no padding
+}
+
+static void rb_state_fill(G3xRouteBPrim& p) {
+    p.sf          = s_blend_sf;
+    p.df          = s_blend_df;
+    p.const_alpha = s_const_alpha;
+    p.constant    = s_constant;
+    p.color_fill  = s_color_fill ? 1u : 0u;
+    p.chroma_on   = s_chroma_on ? 1u : 0u;
+    p.tex_slot    = s_cur;
+    if (s_cur >= 0) {
+        const Tex& t = s_tex[s_cur];
+        p.tex_w = t.w; p.tex_h = t.h; p.tex_lod = t.lod;
+        p.tex_bpp = t.bpp; p.tex_ver = t.ver;
+    } else {
+        p.tex_w = 0; p.tex_h = 0; p.tex_lod = 0; p.tex_bpp = 0; p.tex_ver = 0;
+    }
+    p.pal_ver    = s_palette_epoch;
+    p.chroma_ver = s_chroma_ver;
+}
+
+static void rb_emit_tri(const RVert& A, const RVert& B, const RVert& C,
+                        float tsx, float tsy) {
+    if (!s_routeb || !s_routeb->prim) return;
+    G3xRouteBPrim p;
+    p.kind = 0;
+    p.ax = A.x; p.ay = A.y; p.au = A.u; p.av = A.v; p.aargb = A.argb;
+    p.bx = B.x; p.by = B.y; p.bu = B.u; p.bv = B.v; p.bargb = B.argb;
+    p.cx = C.x; p.cy = C.y; p.cu = C.u; p.cv = C.v; p.cargb = C.argb;
+    p.tsx = tsx; p.tsy = tsy;
+    rb_state_fill(p);
+    s_routeb->prim(s_routeb->ud, &p);
+}
+
+static void rb_emit_rect(float xa, float ya, float xb, float yb) {
+    if (!s_routeb || !s_routeb->prim) return;
+    G3xRouteBPrim p;
+    p.kind = 1;
+    p.ax = xa; p.ay = ya; p.au = 0.0f; p.av = 0.0f; p.aargb = 0;
+    p.bx = xb; p.by = yb; p.bu = 0.0f; p.bv = 0.0f; p.bargb = 0;
+    p.cx = 0.0f; p.cy = 0.0f; p.cu = 0.0f; p.cv = 0.0f; p.cargb = 0;
+    p.tsx = 1.0f; p.tsy = 1.0f;
+    rb_state_fill(p);
+    s_routeb->prim(s_routeb->ud, &p);
+}
+
+static void rb_emit_px(float x, float y) {
+    if (!s_routeb || !s_routeb->prim) return;
+    G3xRouteBPrim p;
+    p.kind = 2;
+    p.ax = x; p.ay = y; p.au = 0.0f; p.av = 0.0f; p.aargb = 0;
+    p.bx = 0.0f; p.by = 0.0f; p.bu = 0.0f; p.bv = 0.0f; p.bargb = 0;
+    p.cx = 0.0f; p.cy = 0.0f; p.cu = 0.0f; p.cv = 0.0f; p.cargb = 0;
+    p.tsx = 1.0f; p.tsy = 1.0f;
+    rb_state_fill(p);
+    s_routeb->prim(s_routeb->ud, &p);
+}
+
+// The dispatcher's raster_tri call, mirrored to the sink. Same call, same
+// order — the sink emission is additive only.
+static void rt_fire(const RVert& A, const RVert& B, const RVert& C,
+                    float tsx, float tsy) {
+    if (s_gpu_emit) {                        // raster=gpu: the kernel draws it
+        rb_emit_tri(A, B, C, tsx, tsy);
+        return;
+    }
+    g3xrc::raster_tri(g3xrc_host(), A, B, C, tsx, tsy);
+    rb_emit_tri(A, B, C, tsx, tsy);
+}
+
+// The D2 glide vertex: x,y @0 (f32), PARGB @8, oow @12, s,t @16/20 (0x1C stride).
+inline void read_vert(RVert& out, const uint8_t* p) {
+    memcpy(&out.x,    p + 0,  4);
+    memcpy(&out.y,    p + 4,  4);
+    memcpy(&out.argb, p + 8,  4);
+    memcpy(&out.u,    p + 16, 4);   // s (ST0 @16)
+    memcpy(&out.v,    p + 20, 4);   // t @20
+}
+
+// Fast path (P2.4, kept): axis-aligned constant-fill quads (fades, dim rects,
+// loading screens — DrawSolidRectEx/DrawSolidRectAlpha) run FULL-SCREEN at
+// 800x600; detect the rect shape at the quad level and fill scanlines
+// directly. Blending applies per pixel through the hoisted blend class.
+// The geometry test + the pixel fill live in g3x_raster_core.h
+// (fill_rect_shape / fill_rect_exec); this wrapper keeps the P2.7 stats and
+// the fill diagnostic.
+bool fill_rect_fast(unsigned count, const RVert* v) {
+    if (!s_color_fill || !s_px) return false;
+    float xa, xb, ya, yb;
+    if (!g3xrc::fill_rect_shape(v, count, xa, xb, ya, yb)) return false;
+    ++s_n_fill;
+    {
+        struct FillKey { uint32_t src; unsigned sf, df; };
+        static FillKey s_seen[12]; static unsigned s_n = 0;
+        const FillKey key = { (s_constant >> 8) & 0x00FFFFFFu, s_blend_sf, s_blend_df };
+        bool seen = false;
+        for (unsigned k = 0; k < s_n; ++k) {
+            if (s_seen[k].src == key.src && s_seen[k].sf == key.sf && s_seen[k].df == key.df) { seen = true; break; }
+        }
+        if (!seen && s_n < 12) {
+            s_seen[s_n++] = key;
+            g3x_log("fill#%u: rect(%.0f,%.0f)..(%.0f,%.0f) src=0x%06x alpha=%u blend=(%u,%u)",
+                    s_n, xa < xb ? xa : xb, ya < yb ? ya : yb, xa > xb ? xa : xb, ya > yb ? ya : yb,
+                    key.src, s_const_alpha, s_blend_sf, s_blend_df);
+        }
+    }
+    if (!s_gpu_emit) g3xrc::fill_rect_exec(g3xrc_host(), xa, xb, ya, yb);
+    rb_emit_rect(xa, ya, xb, yb);
+    return true;
+}
+
+// P2.7 — the UNIFORM coordinate rule (the P2.6 per-axis auto-detect is
+// retired). Ground truth, decoded one level deeper into the game tree:
+// DrawPalettedQuad/DrawPerspectiveImage scale raw sprite coords by
+// gaPerspectiveImageSizeTable[aspect] spans {S,T} = (256,256) square,
+// (256,256>>a) wide, (256>>|a|,256) tall. Reducing texel = coord/Span*dim for
+// every aspect collapses to texel = coord * (2^largeLod / 256) on BOTH axes:
+//   wide  (a >= 0): S span 256      -> texel_s = s*w/256 = s*2^lod/256 (w=2^lod)
+//                   T span 256*h/w -> texel_t = t*h/(256*h/w) = t*w/256
+//   tall  (a  < 0): S span 256*w/h -> texel_s = s*w/(256*w/h) = s*h/256 (h=2^lod)
+//                   T span 256     -> texel_t = t*h/256
+// i.e. coordinates ALWAYS live in the square mip space 2^largeLod x 2^largeLod
+// (256 units = one full square), valid image in the [0,w)x[0,h) sub-rect.
+// This is exactly the P2.2 scalar rule with lod = largeLodLog2 (which Tex
+// stores). P2.6's extent heuristic mis-scaled the SHORT axis of non-square
+// textures (dim/256 instead of 2^lod/256): 64x32 title buttons were crushed
+// to half height (quad#5 field: rows 1..16 instead of 2..32), the 128x64
+// mini-panel to half height (quad#12), 16x128 sprites to an eighth width
+// (quad#14), 32x128/16x32/16x64 similarly. All 14 round-9 field quad classes
+// pin 2^lod/256 on both axes with 1:1 texel:pixel mapping.
+TexSpace tex_space(const RVert* /*v*/, unsigned /*n*/, const Tex& t) {
+    return g3xrc::tex_space_lod(t.lod);   // (1u << lod) / 256.0f on both axes
+}
+
+// Field diagnostic (round 10): the first quads per distinct (dims) class,
+// with raw vertices + the applied square-space scale — verifies the P2.7
+// sampling rule directly in the field log without flooding. P2.8: the line
+// also carries the blend pair + chroma state, because the two open field
+// symptoms (in-game black rects, menu-label black boxes) are both
+// "opaque-black unless chroma punches" classes and the log must show which
+// blend/chroma regime each class drew under.
+void quad_diag(unsigned count, const RVert* v, const Tex& t, float sc) {
+    static unsigned s_w[14], s_h[14], s_n = 0;
+    if (s_n >= 14) return;
+    for (unsigned k = 0; k < s_n; ++k) {
+        if (s_w[k] == t.w && s_h[k] == t.h) return;
+    }
+    s_w[s_n] = t.w; s_h[s_n] = t.h; ++s_n;
+    RVert q[4] = { {}, {}, {}, {} };
+    const unsigned n = count < 4 ? count : 4;
+    for (unsigned i = 0; i < n; ++i) q[i] = v[i];
+    g3x_log("quad#%u: tex %ux%u lod%u sc=%.4g blend=(%u,%u) ca=%u chm=%u "
+            "v0(%.1f,%.1f|c%08x|s%.1f,t%.1f) "
+            "v1(%.1f,%.1f|c%08x|s%.1f,t%.1f) v2(%.1f,%.1f|c%08x|s%.1f,t%.1f) "
+            "v3(%.1f,%.1f|c%08x|s%.1f,t%.1f)",
+            s_n, t.w, t.h, t.lod, sc, s_blend_sf, s_blend_df, s_const_alpha,
+            (unsigned)s_chroma_on,
+            q[0].x, q[0].y, q[0].argb, q[0].u, q[0].v,
+            q[1].x, q[1].y, q[1].argb, q[1].u, q[1].v,
+            q[2].x, q[2].y, q[2].argb, q[2].u, q[2].v,
+            q[3].x, q[3].y, q[3].argb, q[3].u, q[3].v);
+}
+
+// P2.8 field diagnostic: the shadow/darken class — textured quads whose
+// vertex color is (near-)uniform BLACK. Ground truth (D2Glide DrawShadow /
+// DrawShadowQuad): non-blended shadows submit blend (ONE,ZERO) + all-vertex
+// color 0, so the ONLY thing separating a soft shadow blob from a solid
+// black rectangle is chromakey punching the texture's transparent texels.
+// Menu labels draw the same way (SetDrawMode 5/7 -> opaque). Log the first
+// 12 with texture dims, blend, chroma state and the screen rect so the
+// round-11 log can be overlaid directly on the user's screenshots.
+void vc0_diag(unsigned count, const RVert* v, const Tex& t) {
+    static unsigned s_logged = 0;
+    const uint32_t c0 = v[0].argb, c1 = v[1].argb, c2 = v[2].argb, c3 = v[3].argb;
+    const bool three_black = (c0 == 0 && c1 == 0 && c2 == 0);
+    if (!three_black) return;   // not the class (v0..v2 carry the fill color)
+    ++s_n_vc0;
+    if (s_logged >= 12) return;
+    float xa = v[0].x, xb = v[0].x, ya = v[0].y, yb = v[0].y;
+    for (unsigned i = 1; i < 4 && i < count; ++i) {
+        if (v[i].x < xa) xa = v[i].x; if (v[i].x > xb) xb = v[i].x;
+        if (v[i].y < ya) ya = v[i].y; if (v[i].y > yb) yb = v[i].y;
+    }
+    ++s_logged;
+    g3x_log("vc0#%u: tex %ux%u lod%u rect(%.0f,%.0f)..(%.0f,%.0f) "
+            "c=%08x/%08x/%08x/%08x blend=(%u,%u) ca=%u chm=%u fill=%u",
+            s_logged, t.w, t.h, t.lod, xa, ya, xb, yb,
+            c0, c1, c2, c3, s_blend_sf, s_blend_df, s_const_alpha,
+            (unsigned)s_chroma_on, (unsigned)s_color_fill);
+}
+
+// P2.9 field diagnostic: the small-texture (font-glyph / UI-bit) quad class.
+// The round-11 screenshots show the menu labels as glyph cores floating on
+// their own black background bars — with the chroma fix the bars should
+// vanish; these lines pin the glyph textures' CONTENT (top texel indices +
+// their palette colors) and the quads' mapping so any residual label
+// garbling can be decoded directly from the next field log.
+void gly_diag(unsigned count, const RVert* v, const Tex& t, float sc) {
+    static unsigned s_logged = 0;
+    if (s_logged >= 10) return;
+    const unsigned maxdim = t.w > t.h ? t.w : t.h;
+    if (maxdim > 32 || t.bpp != 1 || !t.data) return;
+    unsigned hist[256] = {};
+    const unsigned n = t.w * t.h;
+    for (unsigned i = 0; i < n; ++i) ++hist[t.data[i]];
+    unsigned best[3] = {}, bcnt[3] = {};
+    for (unsigned i = 0; i < 256; ++i) {
+        if (hist[i] > bcnt[0]) {
+            bcnt[2] = bcnt[1]; best[2] = best[1];
+            bcnt[1] = bcnt[0]; best[1] = best[0];
+            bcnt[0] = hist[i]; best[0] = i;
+        } else if (hist[i] > bcnt[1]) {
+            bcnt[2] = bcnt[1]; best[2] = best[1];
+            bcnt[1] = hist[i]; best[1] = i;
+        } else if (hist[i] > bcnt[2]) {
+            bcnt[2] = hist[i]; best[2] = i;
+        }
+    }
+    ++s_logged;
+    g3x_log("gly#%u: tex %ux%u lod%u sc=%.4g rect(%.0f,%.0f)..(%.0f,%.0f) "
+            "s0=%.1f t0=%.1f s2=%.1f t2=%.1f "
+            "top=%u(x%u)/%u(x%u)/%u(x%u) pal[%u]=%08x pal[%u]=%08x pal[%u]=%08x "
+            "blend=(%u,%u) ca=%u chm=%u",
+            s_logged, t.w, t.h, t.lod, sc,
+            v[0].x, v[0].y,
+            v[count < 4 ? count - 1 : 2].x, v[count < 4 ? count - 1 : 2].y,
+            v[0].u, v[0].v, v[2].u, v[2].v,
+            best[0], bcnt[0], best[1], bcnt[1], best[2], bcnt[2],
+            best[0], s_palette[best[0] & 0xFF],
+            best[1], s_palette[best[1] & 0xFF],
+            best[2], s_palette[best[2] & 0xFF],
+            s_blend_sf, s_blend_df, s_const_alpha, (unsigned)s_chroma_on);
+}
+
+void gamma_identity() {
+    for (int c = 0; c < 3; ++c)
+        for (int i = 0; i < 256; ++i) s_gamma_lut[c][i] = (uint8_t)i;
+}
+
+struct GammaInit { GammaInit() { gamma_identity(); } } s_gamma_init;
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+
+// Route-B Stage 1 record sink attach point (see g3x_frame.h). File scope:
+// external linkage, exactly one definition. s_routeb is TU-static.
+void g3x_frame_routeb_sink(const G3xRouteBSink* s) { s_routeb = s; }
+
+void g3x_frame_routeb_detach(const G3xRouteBSink* s) {
+    if (s_routeb == s) s_routeb = nullptr;
+}
+
+void g3x_frame_gpu_emit_only(bool on) { s_gpu_emit = on; }
+
+void g3x_frame_reset(unsigned w, unsigned h) {
+    if (!s_px || s_w != w || s_h != h) {
+        delete[] s_px;
+        s_px = new (std::nothrow) uint32_t[(size_t)w * h];
+    }
+    s_w = w; s_h = h;
+    if (s_px) memset(s_px, 0, (size_t)w * h * 4);
+    if (s_routeb && s_routeb->api_frame) s_routeb->api_frame(s_routeb->ud, w, h);
+}
+
+void g3x_frame_clear(uint32_t color) {
+    if (s_routeb && s_routeb->api_clear) s_routeb->api_clear(s_routeb->ud, color);
+    if (!s_px) return;
+    if ((color & 0x00FFFFFFu) == 0) {           // observed: clear=0 every time
+        memset(s_px, 0, (size_t)s_w * s_h * 4);
+        return;
+    }
+    color |= 0xFF000000u;
+    const size_t n = (size_t)s_w * s_h;
+    for (size_t i = 0; i < n; ++i) s_px[i] = color;
+}
+
+uint8_t* g3x_frame_pixels() { return (uint8_t*)s_px; }
+unsigned g3x_frame_width()  { return s_w; }
+unsigned g3x_frame_height() { return s_h; }
+unsigned g3x_frame_stride() { return s_w * 4; }
+
+void g3x_frame_set_palette(const void* entries256) {
+    if (entries256) memcpy(s_palette, entries256, sizeof(s_palette));
+    ++s_palette_epoch;
+    s_chroma_dirty = true;
+    if (s_routeb && s_routeb->api_palette)
+        s_routeb->api_palette(s_routeb->ud, s_palette);
+    if (s_routeb && s_routeb->table_pal)
+        s_routeb->table_pal(s_routeb->ud, s_palette_epoch, s_palette);
+}
+
+void g3x_frame_set_chromakey(unsigned mode, unsigned value) {
+    if (mode != s_chroma_mode || value != s_chroma_value) ++s_chroma_toggles;
+    s_chroma_mode = mode; s_chroma_value = value;
+    s_chroma_on = (mode == 1);
+    s_chroma_dirty = true;
+    if (s_routeb && s_routeb->api_chromakey)
+        s_routeb->api_chromakey(s_routeb->ud, mode, value);
+    // P2.8: the game flips chroma OFF around DrawSolidRect/DrawLightMap
+    // batches and back ON after; the first 32 transitions show the exact
+    // sequence (and whether it is active at label/shadow draws).
+    static unsigned s_tlog = 0;
+    if (s_tlog < 32) {
+        ++s_tlog;
+        g3x_log("chroma#%u: mode=%u value=0x%x (on=%u)", s_tlog, mode, value,
+                (unsigned)s_chroma_on);
+    }
+}
+
+void g3x_frame_set_blend(unsigned rgb_sf, unsigned rgb_df) {
+    s_blend_sf = rgb_sf; s_blend_df = rgb_df;
+    blend_reclass();
+    if (s_routeb && s_routeb->api_blend)
+        s_routeb->api_blend(s_routeb->ud, rgb_sf, rgb_df);
+}
+
+void g3x_frame_set_constant(unsigned argb) {
+    s_constant = argb;
+    s_const_alpha = argb & 0xFFu;   // game packs blend alpha in bits 7..0
+    if (s_routeb && s_routeb->api_constant) s_routeb->api_constant(s_routeb->ud, argb);
+}
+
+void g3x_frame_set_color_fill(bool fill) {
+    s_color_fill = fill;
+    if (s_routeb && s_routeb->api_colorfill)
+        s_routeb->api_colorfill(s_routeb->ud, fill ? 1u : 0u);
+}
+
+void g3x_frame_set_gamma(float r, float g, float b) {
+    const float gm[3] = { r, g, b };
+    s_gamma_identity = (r == 1.0f && g == 1.0f && b == 1.0f);
+    for (int c = 0; c < 3; ++c) {
+        const float gamma = (gm[c] > 0.05f) ? gm[c] : 1.0f;
+        const float inv = 1.0f / gamma;
+        for (int i = 0; i < 256; ++i) {
+            int out = (int)(pow((double)i / 255.0, (double)inv) * 255.0 + 0.5);
+            if (out < 0) out = 0;
+            if (out > 255) out = 255;
+            s_gamma_lut[c][i] = (uint8_t)out;
+        }
+    }
+}
+
+bool g3x_frame_tex_download(unsigned tmu, unsigned addr, const GrTexInfo* info) {
+    if (!info || !info->data) return false;
+    unsigned w = 0, h = 0;
+    g3x_tex_dims(info->largeLodLog2, (int)info->aspectRatioLog2, &w, &h);
+    if (!w || !h) return false;
+    const unsigned bpp = tex_bytes_per_pixel(info->format);
+    // copy the whole mip chain when present (base = large lod comes first in
+    // the glide layout); sampling only touches the base lod in P2.x.
+    size_t bytes = 0;
+    for (unsigned lod = info->smallLodLog2; lod <= info->largeLodLog2 && lod <= 11; ++lod) {
+        unsigned lw = 0, lh = 0;
+        g3x_tex_dims(lod, (int)info->aspectRatioLog2, &lw, &lh);
+        bytes += (size_t)lw * lh * bpp;
+    }
+    if (!bytes) return false;
+
+    if (s_routeb && s_routeb->api_texdown)
+        s_routeb->api_texdown(s_routeb->ud, tmu, addr, info->largeLodLog2,
+                              (int32_t)info->aspectRatioLog2, info->format,
+                              info->data, (uint32_t)bytes, w, h, bpp);
+
+    const unsigned key = tex_key(tmu, addr);
+    const int slot = tex_slot_alloc(key);
+    if (slot < 0) {
+        ++s_tex_dropped_total;
+        if (!s_warned_tex_full) {
+            s_warned_tex_full = true;
+            g3x_log("frame: texture table full (%u) — downloads dropped", kMaxTex);
+        } else if (s_tex_dropped_total % 500 == 0) {
+            g3x_log("frame: texture table full — %u downloads dropped so far", s_tex_dropped_total);
+        }
+        return false;
+    }
+    Tex& t = s_tex[slot];
+    uint8_t* nd = (uint8_t*)realloc(t.data, bytes);
+    if (!nd) return false;
+    memcpy(nd, info->data, bytes);
+    t.data = nd; t.w = w; t.h = h; t.bpp = bpp; t.used = true;
+    t.lod = info->largeLodLog2 > 11 ? 11 : info->largeLodLog2;
+    ++t.ver;
+    s_keys[slot] = key;
+    tex_hash_insert(key, slot);
+    if (slot + 1 > (int)s_tex_used_hwm) s_tex_used_hwm = (unsigned)(slot + 1);
+    if (s_routeb && s_routeb->table_tex)
+        s_routeb->table_tex(s_routeb->ud, slot, t.ver, nd, (uint32_t)bytes,
+                            w, h, t.lod, bpp);
+    return true;
+}
+
+void g3x_frame_tex_source(unsigned tmu, unsigned addr) {
+    if (s_routeb && s_routeb->api_texsrc)
+        s_routeb->api_texsrc(s_routeb->ud, tmu, addr);
+    const unsigned key = tex_key(tmu, addr);
+    // P2.12 perf rebind fast-out: the game re-binds the same texture across
+    // consecutive draws constantly (tile strips share a download); the hash
+    // lookup below is O(1), but this is O(0). Bind/miss counters unaffected:
+    // the fast-out only fires when s_cur ALREADY holds the requested texture.
+    if (s_cur >= 0 && s_tex[s_cur].used && s_keys[s_cur] == key) return;
+    const int slot = tex_slot_find(key);
+    if (slot >= 0) {
+        const unsigned i = (unsigned)slot;
+        {
+            s_cur = (int)i;
+            // Field diagnostic: log the first few DISTINCT (addr -> dims)
+            // bindings so texture-size mistakes show up in the field log.
+            static unsigned s_seen_addr[24];
+            static unsigned s_seen_w[24], s_seen_h[24];
+            static unsigned s_seen_n = 0;
+            bool seen = false;
+            for (unsigned k = 0; k < s_seen_n; ++k) {
+                if (s_seen_addr[k] == addr && s_seen_w[k] == s_tex[i].w && s_seen_h[k] == s_tex[i].h) { seen = true; break; }
+            }
+            if (!seen && s_seen_n < 24) {
+                s_seen_addr[s_seen_n] = addr;
+                s_seen_w[s_seen_n] = s_tex[i].w;
+                s_seen_h[s_seen_n] = s_tex[i].h;
+                ++s_seen_n;
+                g3x_log("frame: bind tmu=%u 0x%08x -> %ux%u (lod %u)", tmu, addr,
+                        s_tex[i].w, s_tex[i].h, s_tex[i].lod);
+            }
+            return;
+        }
+    }
+    s_cur = -1;
+    ++s_tex_miss_total;
+    // Field diagnostic (round 6): the first 8 DISTINCT missing addresses + a
+    // running total. In-game ground/wall tiles binding nothing = black world,
+    // so misses need to be visible per-address, not just once.
+    static unsigned s_miss_addr[8];
+    static unsigned s_miss_n = 0;
+    bool known = false;
+    for (unsigned k = 0; k < s_miss_n; ++k) {
+        if (s_miss_addr[k] == addr) { known = true; break; }
+    }
+    if (!known && s_miss_n < 8) {
+        s_miss_addr[s_miss_n++] = addr;
+        g3x_log("frame: tex miss tmu=%u addr=0x%08x (no download; draws skipped; total %u)",
+                tmu, addr, s_tex_miss_total);
+    } else if (s_tex_miss_total == 100 || s_tex_miss_total == 1000 || s_tex_miss_total == 10000) {
+        g3x_log("frame: tex miss total=%u (8 distinct logged above)", s_tex_miss_total);
+    } else if (!known) {
+        // distinct beyond 8: keep the count honest without spamming
+        if (s_miss_n == 8 && s_tex_miss_total == 9) {
+            g3x_log("frame: tex miss — more than 8 distinct addresses follow (total %u)", s_tex_miss_total);
+        }
+    }
+}
+
+unsigned g3x_frame_tex_miss_count() {
+    return s_tex_miss_total;
+}
+
+void g3x_frame_draw_stats(unsigned out[9]) {
+    out[0] = s_n_vac; out[1] = s_n_parr; out[2] = s_n_parr_strip;
+    out[3] = s_n_parr_fan; out[4] = s_n_skip_notex;
+    out[5] = s_n_space256; out[6] = s_n_rgb565; out[7] = s_n_fill;
+    out[8] = s_n_vc0;
+}
+
+unsigned g3x_frame_chroma_toggles() {
+    return s_chroma_toggles;
+}
+
+void g3x_frame_tex_table_stats(unsigned* used, unsigned* dropped) {
+    if (used)    *used = s_tex_used_hwm;
+    if (dropped) *dropped = s_tex_dropped_total;
+}
+
+void g3x_frame_draw_fan(unsigned count, const void* base, unsigned stride) {
+    if (!s_px || !base || count < 3 || stride < 24) return;
+    if (s_cur < 0 && !s_color_fill) { ++s_n_skip_notex; return; }
+    ++s_n_vac;
+    chroma_sync();
+    RVert verts[64];
+    if (count > 64) count = 64;
+    for (unsigned i = 0; i < count; ++i) {
+        read_vert(verts[i], (const uint8_t*)base + (size_t)i * stride);
+    }
+    if (s_routeb && s_routeb->api_drawfan) {
+        uint32_t tmp[64 * 5];
+        for (unsigned i = 0; i < count; ++i) rb_pack20(&tmp[i * 5], verts[i]);
+        s_routeb->api_drawfan(s_routeb->ud, count, tmp);
+    }
+    if (!fill_rect_fast(count, verts)) {        // P2.4: fades/dim rects
+        if (s_cur >= 0) vc0_diag(count, verts, s_tex[s_cur]);   // P2.8 shadows
+    } else {
+        return;   // P2.8: the fill fast path owns the quad — falling through
+                  // would draw it a second time through the triangle loop
+    }
+    float tsx = 1.0f, tsy = 1.0f;
+    if (s_cur >= 0) {
+        const Tex& t = s_tex[s_cur];
+        if (t.bpp == 2) ++s_n_rgb565;
+        const TexSpace ts = tex_space(verts, count, t);
+        tsx = ts.sx; tsy = ts.sy;
+        if (tsx != 1.0f) ++s_n_space256;
+        quad_diag(count, verts, t, tsx);
+        gly_diag(count, verts, t, tsx);   // P2.9: font-glyph/UI-bit class
+    }
+    // Field diagnostic: the first fans' raw vertices (x,y | color | s,t) — the
+    // ground truth for the s/t convention, quad geometry AND vertex colors
+    // (ground lighting = 0xFFRRGGBB light-table tints; UI = 0xFFFFFFFF white).
+    static unsigned s_dumped = 0;
+    if (s_dumped < 8) {
+        g3x_log("fan#%u: v0(%.1f,%.1f|c%08x|%.2f,%.2f) v1(%.1f,%.1f|c%08x|%.2f,%.2f) "
+                "v2(%.1f,%.1f|c%08x|%.2f,%.2f) v3(%.1f,%.1f|c%08x|%.2f,%.2f)",
+                s_dumped + 1,
+                verts[0].x, verts[0].y, verts[0].argb, verts[0].u, verts[0].v,
+                verts[1].x, verts[1].y, verts[1].argb, verts[1].u, verts[1].v,
+                verts[2].x, verts[2].y, verts[2].argb, verts[2].u, verts[2].v,
+                verts[3].x, verts[3].y, verts[3].argb, verts[3].u, verts[3].v);
+        ++s_dumped;
+    }
+    for (unsigned i = 1; i + 1 < count; ++i) {
+        rt_fire(verts[0], verts[i], verts[i + 1], tsx, tsy);
+    }
+}
+
+void g3x_frame_draw_pointers(unsigned mode, unsigned count, void* const* pointers) {
+    if (!s_px || !pointers || count < 3) return;
+    if (s_cur < 0 && !s_color_fill) { ++s_n_skip_notex; return; }
+    ++s_n_parr;
+    chroma_sync();
+    if (count > 64) count = 64;
+    RVert verts[64];
+    for (unsigned i = 0; i < count; ++i) {
+        const uint8_t* p = (const uint8_t*)pointers[i];
+        if (!p) return;
+        read_vert(verts[i], p);   // pointer-array vertices: fixed 0x1C layout
+    }
+    if (s_routeb && s_routeb->api_drawptrs) {
+        uint32_t tmp[64 * 5];
+        for (unsigned i = 0; i < count; ++i) rb_pack20(&tmp[i * 5], verts[i]);
+        s_routeb->api_drawptrs(s_routeb->ud, mode, count, tmp);
+    }
+    if (!fill_rect_fast(count, verts)) {        // P2.4: fades/dim rects
+        if (s_cur >= 0) vc0_diag(count, verts, s_tex[s_cur]);   // P2.8 shadows
+    } else {
+        return;   // P2.8: same double-draw guard as the fan path
+    }
+    float tsx = 1.0f, tsy = 1.0f;
+    if (s_cur >= 0) {
+        const Tex& t = s_tex[s_cur];
+        if (t.bpp == 2) ++s_n_rgb565;
+        const TexSpace ts = tex_space(verts, count, t);
+        tsx = ts.sx; tsy = ts.sy;
+        if (tsx != 1.0f) ++s_n_space256;
+        quad_diag(count, verts, t, tsx);
+        gly_diag(count, verts, t, tsx);   // P2.9: font-glyph/UI-bit class
+    }
+    // Field diagnostic: the pointer-array path (ground tiles / wall strips).
+    // First 4 draws log the primitive + first vertex colors so ground lighting
+    // values show up in the field log.
+    static unsigned s_pdumped = 0;
+    if (s_pdumped < 4) {
+        g3x_log("parr#%u: mode=%u count=%u c0=%08x c1=%08x c2=%08x c3=%08x",
+                s_pdumped + 1, mode, count,
+                verts[0].argb, verts[1].argb, verts[2].argb, verts[3].argb);
+        ++s_pdumped;
+    }
+    if (mode == G3X_GR_TRIANGLE_FAN) {
+        ++s_n_parr_fan;
+        for (unsigned i = 1; i + 1 < count; ++i) {
+            rt_fire(verts[0], verts[i], verts[i + 1], tsx, tsy);
+        }
+    } else if (mode == G3X_GR_TRIANGLE_STRIP) {
+        ++s_n_parr_strip;
+        // Triangle strip: consecutive triangles alternate winding; normalize
+        // to the rasterizer's CCW (y-down) convention per triangle. Shared
+        // edges between neighbours then fall on opposite directed edges, so
+        // the top-left ownership rule still assigns each edge pixel exactly
+        // once (no seams under opaque, no double-blend under additive).
+        for (unsigned i = 0; i + 2 < count; ++i) {
+            const RVert& a = verts[i];
+            const RVert& b = verts[i + 1];
+            const RVert& c = verts[i + 2];
+            const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            if (area >= 0.0f) rt_fire(a, b, c, tsx, tsy);
+            else              rt_fire(a, c, b, tsx, tsy);
+        }
+    }
+    // other primitives: counted by the caller, not rasterized (as before)
+}
+
+// P2.5: grDrawPoint / grDrawLine. The game's only callers (D2Glide
+// DrawLine/DrawPoint at Renderer/Glide.cpp:2296+, plus the radial-light dot
+// helpers) always set colorCombine(2) (constant fill) + chromakey OFF first
+// and pack the color as ScalePaletteValue|alpha, so the source pixel is the
+// constant fill color through the CURRENT blend pair (mode 1 = opaque automap
+// lines, mode 4 = alpha-scaled ones).
+void g3x_frame_draw_point(float x, float y) {
+    if (!s_px) return;
+    if (s_routeb && s_routeb->api_point) s_routeb->api_point(s_routeb->ud, x, y);
+    const int px = (int)(x + 0.5f), py = (int)(y + 0.5f);
+    if (px < 0 || py < 0 || px >= (int)s_w || py >= (int)s_h) return;
+    uint32_t* row = s_px + (size_t)py * s_w;
+    auto& h = g3xrc_host();
+    if (!s_gpu_emit) row[px] = g3xrc::blend_px(h, row[px], g3xrc::const_fill_rgb(h));
+    rb_emit_px(x, y);
+}
+
+void g3x_frame_draw_line(float x0, float y0, float x1, float y1) {
+    if (!s_px) return;
+    if (s_routeb && s_routeb->api_line)
+        s_routeb->api_line(s_routeb->ud, x0, y0, x1, y1);
+    int xa = (int)(x0 + 0.5f), ya = (int)(y0 + 0.5f);
+    int xb = (int)(x1 + 0.5f), yb = (int)(y1 + 0.5f);
+    int dx = xb - xa; if (dx < 0) dx = -dx;
+    int dy = yb - ya; if (dy < 0) dy = -dy;
+    const int sx = xa < xb ? 1 : -1, sy = ya < yb ? 1 : -1;
+    int err = dx - dy;
+    auto& h = g3xrc_host();
+    const uint32_t src = g3xrc::const_fill_rgb(h);
+    for (;;) {
+        if ((unsigned)xa < s_w && (unsigned)ya < s_h) {
+            uint32_t* row = s_px + (size_t)ya * s_w;
+            if (!s_gpu_emit) row[xa] = g3xrc::blend_px(h, row[xa], src);
+            rb_emit_px((float)xa, (float)ya);
+        }
+        if (xa == xb && ya == yb) break;
+        const int e2 = err * 2;
+        if (e2 > -dy) { err -= dy; xa += sx; }
+        if (e2 <  dx) { err += dx; ya += sy; }
+    }
+}
+
+// Gamma-correct (and, when the target differs, nearest-scale) the raster
+// buffer into a BGRA8 staging buffer. Shared by the legacy compose path
+// (scales to the swapchain extent) and the P3 slang path (native res, 1:1).
+//
+// 0.4.5: when the target's ratio differs from the source's, this now FITS +
+// CENTERS with black bars instead of stretching — 800x600 into a 1920x1080
+// window used to distort 4:3 content to 16:9, and the window presets make
+// 16:9 client sizes routine. Same geometry the chain's scale=fit uses, so
+// the legacy and chain paths agree. The 1:1 fast path is untouched; the bar
+// fill is a few hundred KB of writes, noise next to the copy itself. Bars
+// are plain zero fill: alpha is don't-care for an opaque present buffer.
+static void gamma_scale_copy(uint8_t* dst, unsigned dw, unsigned dh) {
+    if (s_gamma_identity && dw == s_w && dh == s_h) {
+        std::memcpy(dst, s_px, (size_t)s_w * s_h * 4);
+        return;
+    }
+    // fit + center: cross-multiply to compare ratios without floats
+    unsigned rw = dw, rh = dh, ox = 0, oy = 0;
+    const uint64_t src_x = (uint64_t)s_w * dh;
+    const uint64_t dst_x = (uint64_t)dw * s_h;
+    if (src_x != dst_x) {
+        if (src_x > dst_x) {                        // source wider -> bars top/bottom
+            rh = (unsigned)((uint64_t)dw * s_h / s_w);
+            if (!rh) rh = 1;
+            oy = (dh - rh) / 2;
+        } else {                                    // source taller -> bars left/right
+            rw = (unsigned)((uint64_t)dh * s_w / s_h);
+            if (!rw) rw = 1;
+            ox = (dw - rw) / 2;
+        }
+        uint32_t* d32 = (uint32_t*)dst;
+        for (unsigned y = 0; y < oy; ++y)                     // top band
+            std::memset(d32 + (size_t)y * dw, 0, (size_t)dw * 4);
+        for (unsigned y = oy + rh; y < dh; ++y)               // bottom band
+            std::memset(d32 + (size_t)y * dw, 0, (size_t)dw * 4);
+        for (unsigned y = oy; y < oy + rh; ++y) {             // middle band edges
+            if (ox) std::memset(d32 + (size_t)y * dw, 0, (size_t)ox * 4);
+            if (dw > ox + rw)
+                std::memset(d32 + (size_t)y * dw + ox + rw, 0,
+                            (size_t)(dw - ox - rw) * 4);
+        }
+    }
+    uint8_t* d = dst + ((size_t)oy * dw + ox) * 4;
+    for (unsigned y = 0; y < rh; ++y) {
+        const unsigned sy = y * s_h / rh;
+        const uint32_t* row = s_px + (size_t)sy * s_w;
+        for (unsigned x = 0; x < rw; ++x, d += 4) {
+            const unsigned sx = x * s_w / rw;
+            const uint32_t p = row[sx];
+            d[0] = s_gamma_lut[2][p & 0xFF];          // B
+            d[1] = s_gamma_lut[1][(p >> 8) & 0xFF];   // G
+            d[2] = s_gamma_lut[0][(p >> 16) & 0xFF];  // R
+            d[3] = 0xFF;
+        }
+        d = dst + ((size_t)(oy + y + 1) * dw + ox) * 4;   // next row start
+    }
+}
+
+// ---- 0.4.6: the Scroll Lock overlay toggle ---------------------------------
+
+// Edge-polled from the present seam (g3x_frame_present, below) on every
+// presented frame — the same always-on home as the Shift+V conf-panel poll,
+// and deliberately NOT inside g3x_slang: the overlay exists with or without a
+// preset chain, so its toggle must too (the F11/F12 polls only run while a
+// chain filters). Same focus rule as every polled hotkey here: presses made
+// while another window is foreground never toggle (GetAsyncKeyState is
+// process-global otherwise) — and an unfocused Scroll Lock press leaves the
+// latch reset, so alt-tabbing back never fires a stale toggle.
+//
+// Feedback: the boxes vanishing/reappearing IS the visual answer (nothing
+// draws while the overlay is off, toasts included — the "off" press cannot
+// show a toast in a box that just died, so only the show press toasts, and
+// every press lands in glide3x.log). The OS-side Scroll Lock LED is the
+// keyboard's own business and is left alone.
+static bool s_prev_scroll = false;
+static void overlay_scrolllock_poll() {
+    if (GetForegroundWindow() != g_vk.hwnd) {
+        s_prev_scroll = false;                   // don't queue presses made elsewhere
+        return;
+    }
+    const bool scroll = (GetAsyncKeyState(VK_SCROLL) & 0x8000) != 0;
+    if (scroll && !s_prev_scroll) {
+        const bool on = g3x_overlay_toggle();
+        if (on) g3x_overlay_toast("overlay on");
+        g3x_log("overlay: %s (Scroll Lock)", on ? "on" : "off");
+    }
+    s_prev_scroll = scroll;
+}
+
+// ---- 0.4.6: the PrintScreen screenshot key ---------------------------------
+
+// The capture points live where the PRESENTED raster exists: the slang path
+// takes its shot inside g3x_slang_present's GPU half (swapchain readback —
+// slang-FILTERED pixels, overlay boxes included), the legacy path captures
+// compose right before present_pixels (byte-identical to what gets uploaded —
+// post-gamma, overlay included). WYSIWYG is the rule now: a shot shows what
+// the screen shows; the Scroll Lock toggle still yields clean shots (boxes
+// hidden = nothing drawn into the frame the shot copies). The toast fires
+// only when the overlay can actually draw it; the log line is unconditional.
+static void shot_submit_and_report(const uint8_t* bgra, unsigned w, unsigned h) {
+    char name[64];
+    if (g3x_shot_submit(bgra, w, h, name, sizeof(name))) {
+        char msg[80];
+        std::snprintf(msg, sizeof(msg), "saved %s", name);
+        g3x_overlay_toast(msg);
+    }
+}
+
+bool g3x_frame_present() {
+    unsigned ext_w = 0, ext_h = 0;
+    g3x_vk_present_extent(&ext_w, &ext_h);
+    if (!ext_w || !ext_h || !s_px) return false;
+
+    // 0.4.5 addendum: the tag line's FPS field — one tick per PRESENTED frame.
+    // Both present paths funnel through this seam (grBufferSwap for gameplay,
+    // grLfbUnlock for the Bink video loop — which never calls grBufferSwap),
+    // so the per-second count matches the game's own frame pace: what the
+    // in-game /fps readout would have shown, without /fps. GetTickCount64 is
+    // monotonic ms; the meter itself is pure (see g3x_overlay.h) and fed the
+    // clock reading from here so it stays host-testable.
+    g3x_overlay_fps_tick(GetTickCount64());
+
+    // 0.4.6: Scroll Lock overlay toggle — polled first, so a press that hides
+    // the overlay takes effect for THIS frame already (the render calls below
+    // gate on the fresh state) and nothing stale flashes for one present.
+    overlay_scrolllock_poll();
+
+    // 0.4.6: PrintScreen screenshot poll — edge-latched like the Scroll Lock
+    // toggle, and deliberately NOT parked while the overlay is toggled off
+    // (clean shots are the point; while the boxes are hidden the toast simply
+    // cannot draw and the log line is the only feedback). The press is served
+    // at one of the two capture points below, before the overlay renders.
+    g3x_shot_poll();
+
+    // 0.4.5: Shift+V conf panel poll — on the present seam like the overlay
+    // itself, and UNCONDITIONALLY (the F11/F12 slang hotkeys only poll while
+    // a chain filters frames; the conf panel also covers the controller=/
+    // window= options that matter without one). The poll itself early-outs
+    // while the overlay is toggled off — a hidden panel must not keep editing
+    // the conf invisibly, and the arrow keys stay the game's.
+    g3x_slang_conf_panel_poll();
+
+    // Route-B Stage 2: raster=gpu frames render here — kernel dispatch, the
+    // out->image copy and the present in one backend submission. A frame with
+    // zero primitives (Bink/LFB) returns false and falls through to the CPU
+    // compose path as always: the mode switch is per-frame and free. The
+    // gamma LUT + overlay boxes join the GPU path in Stage 3 (the log says so
+    // once when a non-identity gamma runs on a GPU frame).
+    if (g3x_raster_gpu_active() && g3x_raster_gpu_end_frame()) return true;
+
+    // P3: preset-chain path. The chain receives the gamma-corrected NATIVE
+    // game resolution (no pre-scaling) so the preset's own scaling algorithms
+    // see the true source size — 640x480 in, big-window out is the P3 exit
+    // shape. The overlay is drawn at game res and filters along with the
+    // frame (WYSIWYG); it still never touches the game's own framebuffer.
+    if (g3x_slang_active()) {
+        static uint8_t* slang_buf = nullptr;
+        static unsigned slang_cap = 0;
+        const size_t sneed = (size_t)s_w * s_h * 4;
+        if (slang_cap < sneed) {
+            delete[] slang_buf;
+            slang_buf = new (std::nothrow) uint8_t[sneed];
+            if (!slang_buf) { slang_cap = 0; return false; }
+            slang_cap = (unsigned)sneed;
+        }
+        gamma_scale_copy(slang_buf, s_w, s_h);
+        // 0.4.6 capture point (slang path): NOT here anymore. The shot is
+        // the PRESENTED image — taken inside g3x_slang_present's GPU half
+        // after the chain rendered, via the swapchain readback in vk_backend
+        // (filtered pixels, overlay included). A press on a frame whose chain
+        // fails stays pending and the legacy tail below serves it instead.
+        g3x_overlay_render(slang_buf, s_w, s_h);
+        if (g3x_slang_present(slang_buf, s_w, s_h)) return true;
+        g3x_log_once("slang-fell", "preset chain unavailable — unfiltered present this frame");
+    }
+
+    static uint8_t* compose = nullptr;
+    static unsigned compose_cap = 0;
+    const size_t need = (size_t)ext_w * ext_h * 4;
+    if (compose_cap < need) {
+        delete[] compose;
+        compose = new (std::nothrow) uint8_t[need];
+        if (!compose) { compose_cap = 0; return false; }
+        compose_cap = (unsigned)need;
+    }
+    // P2.5 fast path lives inside gamma_scale_copy: 1:1 window + identity
+    // gamma = straight copy (the dword layout already matches the swapchain's
+    // BGRA byte order).
+    gamma_scale_copy(compose, ext_w, ext_h);
+    // P2.10: version tag — post-gamma, swapchain-resolution, drawn over
+    // everything (including the LFB/Bink path); never enters the game's own
+    // framebuffer, so grLfbLock reads and fade logic never see it.
+    g3x_overlay_render(compose, ext_w, ext_h);
+    // 0.4.6 capture point (legacy path): compose IS the presented raster —
+    // post-gamma, overlay boxes included, window-sized. Copy-free: the PNG
+    // encoder reads straight from the buffer present_pixels is about to
+    // upload, so the shot is byte-identical to what the swapchain shows. A
+    // press left pending by a same-frame slang chain failure lands here (the
+    // slang path consumed it only on a successful render).
+    if (g3x_shot_take_pending()) shot_submit_and_report(compose, ext_w, ext_h);
+    return g3x_vk_present_pixels(compose, ext_w, ext_h);
+}

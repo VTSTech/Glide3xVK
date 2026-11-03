@@ -1,0 +1,138 @@
+; d2slangvk.conf — glide3xvk 0.4.6 preset-chain settings.
+; Copy this file beside Game.exe (same folder as glide3x.dll + glide3xvk.ini)
+; and uncomment "preset=" to enable. No file (or no preset= line) = the DLL
+; presents unfiltered, exactly like 0.3.x.
+;
+; The file is re-read automatically (also while the game runs): edit it or the
+; .slangp preset in place and the chain reloads within ~half a second. Syntax:
+; [slangvk] header, key=value lines, ';' or '#' comment to end of line, later
+; assignments win, unknown keys ignored, bad values keep the default.
+;
+; Full story: README.md ("d2slangvk.conf reference"). Presets are libretro
+; .slangp files — point preset= at your RetroArch shaders (e.g. Shaders/crt/...)
+; or the two starters shipped in glide3xvk/presets/.
+
+[slangvk]
+
+; Path to a .slangp preset. Relative paths resolve against the game exe
+; folder; drive-letter paths work too. Empty/missing line = chain disabled.
+;preset=presets/glide3xvk-scanline.slangp
+;preset=presets/glide3xvk-sharpen.slangp
+;preset=Shaders/crt/crt-royale.slangp
+
+; The Ctrl+Left/Right cycle list (0.4.6): up to eight presets to step through
+; in-game — Ctrl+Right forward, Ctrl+Left back, wrapping, with a toast. Same
+; path rules as preset= (relative resolves against the game exe folder);
+; empty slots are skipped, order is 1..8. A pick lives for the session (it
+; survives D2's context re-opens) and yields to preset= the moment the file's
+; preset= changes. No chain is required — cycling from a preset-less conf
+; builds the chain on the spot. Add preset= itself to the list if it should
+; be part of the rotation.
+;preset_1=presets/glide3xvk-scanline.slangp
+;preset_2=presets/glide3xvk-sharpen.slangp
+;preset_3=Shaders/crt/crt-royale.slangp
+
+; PrintScreen screenshot key (0.4.6): press PrintScreen in-game to save the
+; presented frame as a PNG into screenshots\ beside the game exe — WYSIWYG:
+; shader-filtered pixels with the overlay boxes drawn in (Scroll Lock toggled
+; off = clean shots). 0 = the hotkey
+; logs once and does nothing. The readback + encode+write costs a few ms on
+; the press.
+;screenshots=1
+
+; How the game frame sits in the window when the preset chain is on:
+;   fit      — fit + center, letterboxed (default)
+;   integer  — largest whole-number multiple of the game resolution, centered
+;   stretch  — fill the window edge to edge
+; Ignored while an explicit aspect= (or an F11 pick) is active.
+scale=fit
+
+; Vertical sync for the swapchain the chain renders into:
+;   (empty)  — default: FIFO (vsync on)
+;   0        — prefer IMMEDIATE (no vsync; falls back to FIFO if unsupported)
+;   1        — FIFO
+; Applied when the swapchain is (re)created: game start / resolution change.
+vsync=
+
+; Content aspect (0.4.3). auto = follow scale= (default). A fixed ratio
+; letterboxes the chain output into the largest centered rect of that ratio
+; inside the window (4:3 on a 16:9 window = pillarbox). F11 cycles this live
+; for the session.
+;aspect=auto
+;aspect=4:3
+;aspect=16:10
+;aspect=16:9
+
+; Shader base resolution (0.4.3): the game frame is linearly upscaled N-x on
+; the GPU before the chain sees it, so source-relative pass FBOs (scanlines,
+; glow, blur) render at N-x — finer effects, one extra fullscreen blit.
+; Accepts 1x|2x|3x|4x (bare 1..4 too). F12 cycles this live for the session.
+;base_res=1x
+
+; Present-window preset (0.4.5): sizes the OS window the game presents into.
+;   native   — the game's own 800x600 window (default; nothing is touched)
+;   240p     — 320x240        480p — 640x480        576p — 720x576 (PAL 4:3)
+;   720p     — 1280x720       768p — 1366x768      1080p — 1920x1080
+;   desktop  — the current monitor's size, borderless
+;   WxH      — any explicit client size, e.g. 1600x1200
+; Windowed presets are centered on the current monitor; the resize is
+; DPI-aware (true physical pixels — no desktop-scaling surprises). The game
+; still renders 800x600; the wrapper scales it (L4: the game's render
+; resolution is the game's). Config-only: applied at renderer open and
+; hot-reloaded when this file changes (no hotkey — F10 is a game keybind).
+;window=native
+;window=1080p
+;window=1600x1200
+
+; Strip the caption/borders on preset windows (0.4.5). desktop is borderless
+; regardless. 0/empty = keep the game's own frame.
+;borderless=0
+
+; Controller support (0.4.5, experimental): gamepad-to-mouse/keys via input
+; injection. controller=1 polls pad 0 through XInput on a background thread
+; and injects ordinary mouse/keyboard events, so the game sees a normal mouse and
+; keyboard and every screen works. Off by default. Injects only while the
+; game window is focused. Map v2 (tuned for Diablo II, where movement IS
+; the mouse):
+;   left stick = walk (steers the cursor and holds LMB while deflected)
+;   right stick = fine aim (~35% speed: place the cursor on monsters,
+;                 portals, chests, item labels without pixel-hunting)
+;   LT = left click (hold)     RT = right click (hold)
+;   A = hold Shift+LMB: attack IN PLACE toward the cursor — melee swings /
+;       ranged shots at whatever is near it without moving, no pixel-perfect
+;       aim needed (or just brush the walking cursor across a monster)
+;   B = hold Alt (item labels) X = Space (close screens)  Y = I (inventory)
+;   D-pad = belt 1-4           LB = C (character)         RB = T (skills)
+;   L3 = R (run/walk)          Start = Esc                Back = Tab (automap)
+; XInput loads dynamically (xinput1_4 / xinput9_1_0 / xinput1_3); a missing
+; DLL or pad just logs once and the game runs untouched.
+;controller=0
+;controller=1
+
+; Cursor speed multiplier for the left stick (full tilt ~1200 px/s at 1.0;
+; the squared response curve keeps precision near center). Default 1.0.
+;controller_sens=1.0
+
+; Right-stick fine-aim speed as a multiplier of the left stick. Default 0.35
+; (slower on purpose — this is the precision stick).
+;controller_aimsens=0.35
+
+; Radial stick deadzone as a percent of full throw (1-80). Default 15.
+;controller_deadzone=15
+
+; Left-stick walk behavior: deflection holds left click so the character
+; walks toward the cursor. Uncomment for a cursor-only left stick.
+;controller_moveclick=0
+
+; Cursor-home (default on, experimental): after ~0.4s of quiet the cursor
+; moves back onto the player, and every stick move emanates from there —
+; the cursor can't get lost at the screen edge. Home self-syncs: a D2 walk
+; always ends with the character standing at the cursor, so each walk
+; release re-homes it. The cursor is parked, not hidden (hiding the game's
+; own cursor sprite is Game.exe territory). Requires controller_moveclick.
+; Uncomment for a free cursor.
+;controller_home=0
+
+; On any preset failure the DLL keeps presenting the raw game frame (fail-soft,
+; the log carries the slang error). There is no other fallback mode; unknown
+; keys are ignored.

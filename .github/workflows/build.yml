@@ -1,0 +1,185 @@
+name: build
+
+on:
+  push:
+    branches: [main, Glide3xVK]
+    paths-ignore: ['**.md']
+  pull_request:
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+# A newer push makes an older build of the same ref pointless.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+# Builds glide3x.dll — the whole point of this repo. Self-contained: it needs
+# no game objects to link, only the pinned libslang-vk checkout for the
+# preset chain.
+
+jobs:
+  glide3x:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # P3: the preset chain links the static slangvk target from the
+      # libslang-vk checkout. Pinned for reproducible builds - bump with care
+      # (BUILD-32BIT.md holds the i686 recipe + verification checklist).
+      - name: Check out libslang-vk (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: VTSTech/libslang-vk
+          ref: d208ac59d2756b714e34d502727f46fe0f7aaa7e
+          path: libslang-vk
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++-mingw-w64-i686 binutils-mingw-w64-i686 cmake ninja-build glslang-tools
+
+      # Route-B Stage 2: the DLL loads routeb.comp.spv from its own directory
+      # (fail-soft to the CPU raster without it) — so the artifact ships the
+      # EXACT kernel blob the routeb job hash-verifies, not a stale copy.
+      - name: Compile the Route-B kernel to SPIR-V (ships beside the DLL)
+        run: |
+          glslangValidator -V spike/routeb.comp -o routeb.comp.spv
+          echo "routeb.comp.spv: $(stat -c %s routeb.comp.spv) bytes"
+
+      - name: Kernel is generated from the core (structural single-source)
+        run: python3 scripts/gen_raster_glsl.py --check
+
+      - name: Build glide3x.dll
+        run: |
+          cmake -S . -B build-g3x -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-i686.cmake \
+            -DG3XVK_SLANGVK_DIR=${{ github.workspace }}/libslang-vk
+          cmake --build build-g3x --target glide3x
+
+      # The game resolves exactly the 45 stdcall exports glide3x.def lists,
+      # and the CMake configure already FATAL-errors if the .def count drifts.
+      # Here: count what the LINKED DLL actually exports and sanity-print the
+      # version line the overlay/log banner carries.
+      - name: Check the Glide export surface
+        run: |
+          n=$(i686-w64-mingw32-objdump -p build-g3x/glide3x.dll \
+              | sed -n '/Ordinal\/Name Pointer/,$p' \
+              | grep -cE '_[A-Za-z]+@[0-9]+')
+          test "$n" -eq 45 || { echo "expected 45 Glide exports, found $n"; exit 1; }
+          echo "glide3x.dll: $n exports, $(stat -c %s build-g3x/glide3x.dll) bytes"
+          i686-w64-mingw32-strings build-g3x/glide3x.dll | grep -m1 '^glide3xvk ' || true
+
+      # Artifact names carry the short commit hash so a downloaded zip is
+      # self-identifying - the same 7-char form the DLL's log banner uses
+      # (git rev-parse --short=7, see CMakeLists). PR runs must use the head
+      # sha: github.sha there is the preview merge commit, which never exists
+      # in the branch history. The DLL inside stays glide3x.dll (drop-in
+      # name the game loads); only the artifact name is versioned.
+      - name: Compute short commit hash for artifact names
+        id: shortsha
+        run: |
+          sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+      # Artifact = the DLL plus the scripts/*.cmd helpers, flat at the zip
+      # root: unzip-all into the game folder is a drop-in DLL with the tools
+      # beside it. gen_font8x8.py stays repo-side: a font-header dev tool, not
+      # a player-facing helper.
+      - name: Stage artifact contents (DLL + helper scripts)
+        run: |
+          mkdir -p stage
+          cp build-g3x/glide3x.dll stage/
+          cp scripts/*.cmd stage/
+          cp routeb.comp.spv stage/
+          ls -la stage/
+
+      - name: Upload glide3x.dll + helper scripts + kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: glide3x-dll-${{ steps.shortsha.outputs.short }}
+          path: stage/*
+          if-no-files-found: error
+
+  # Route-B Stage 0 (ROUTE-B.md): the compute rasterizer's bit-exactness gate.
+  # The same deterministic corpus is rasterized twice — by the production CPU
+  # raster (spike/raster_regress cpu) and by spike/routeb.comp on Lavapipe —
+  # and the per-frame hashes must diff clean. Also asserts the kernel's
+  # `precise` qualifiers survived compilation (NoContraction decorations:
+  # without them a driver may FMA-contract the edge math and break bit-
+  # exactness silently). A red run here means the kernel or the corpus
+  # changed behavior — fix the kernel, never "re-pin" the corpus casually.
+  routeb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kernel is generated from the core (structural single-source)
+        run: python3 scripts/gen_raster_glsl.py --check
+
+      - name: Install the tools (compiler, Vulkan loader + Lavapipe, glslang)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++ libvulkan-dev mesa-vulkan-drivers \
+            glslang-tools spirv-tools
+
+      - name: Compile the kernel to SPIR-V
+        run: glslangValidator -V spike/routeb.comp -o routeb.comp.spv
+
+      - name: Assert NoContraction survived (the precise-qualifier check)
+        run: |
+          spirv-dis routeb.comp.spv -o /tmp/routeb.dis
+          n=$(grep -c 'NoContraction' /tmp/routeb.dis || true)
+          echo "NoContraction decorations: $n"
+          test "$n" -gt 0 || { echo "precise qualifiers lost — FMA contraction risk"; exit 1; }
+
+      - name: Build the parity harness (CPU + GPU modes)
+        run: |
+          g++ -O2 -std=c++17 -DROUTEB_HAVE_GPU -I spike/fakewin -I src \
+              -I vendor/volk -I vendor/Vulkan-Headers/include \
+              spike/raster_regress.cpp spike/routeb_gpu.cpp src/g3x_frame.cpp \
+              vendor/volk/volk.c -ldl -lpthread -o raster_regress
+
+      - name: CPU pin (the production raster, vs the committed Stage-1 pin)
+        run: |
+          ./raster_regress cpu | tee cpu.txt
+          if ! diff -u spike/raster_hashes_stage1.txt cpu.txt; then
+            echo "the CPU raster drifted from the committed Stage-1 pin"
+            echo "(a deliberate corpus/raster change re-pins the file — with the field log quoted)"
+            exit 1
+          fi
+
+      - name: GPU run (the kernel on Lavapipe)
+        run: |
+          # mesa >= 24.3 ships the lavapipe ICD as lvp_icd.json (no arch
+          # suffix); older mesas shipped lvp_icd.x86_64.json. A pinned
+          # VK_DRIVER_FILES that names a missing file SUPPRESSES the loader's
+          # default ICD search entirely (vkCreateInstance then fails with
+          # VK_ERROR_INCOMPATIBLE_DRIVER) — so glob, and fall back to plain
+          # discovery if nothing matches.
+          ls -la /usr/share/vulkan/icd.d/ || true
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -n1)
+          if [ -n "$icd" ]; then
+            echo "pinning VK_DRIVER_FILES to $icd"
+            export VK_DRIVER_FILES="$icd"
+            export VK_ICD_FILENAMES="$icd"
+          else
+            echo "no lvp_icd*.json found — relying on loader auto-discovery"
+          fi
+          ./raster_regress gpu routeb.comp.spv | tee gpu.txt
+
+      - name: Bit-exactness gate (CPU == GPU, frame by frame)
+        run: |
+          if ! diff -u cpu.txt gpu.txt; then
+            echo "ROUTE-B: the kernel diverged from the CPU raster"
+            exit 1
+          fi
+          echo "ROUTE-B Stage 1: $(wc -l < gpu.txt) frames bit-identical (binned, overlapping corpus)"
+
+      - name: fxparity replay gate (a real field capture through BOTH backends)
+        run: |
+          if [ -f spike/fxparity.cap ]; then
+            ./raster_regress replay spike/fxparity.cap routeb.comp.spv
+          else
+            echo "no spike/fxparity.cap committed yet — arm it by recording with"
+            echo "[glide3xvk] fxcapture=1 in glide3xvk.ini, then commit the file here"
+          fi
+
