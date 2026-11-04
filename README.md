@@ -1,5 +1,7 @@
 # glide3xvk — our own `glide3x.dll` for D2LoD (Glide 3 → Vulkan)
 
+This project originally lived at https://github.com/VTSTech/D2VP-QoL - Before discovering I could implement Vulkan and Shaders entirely in Glide3x without modifying D2 Source, 0.0.1-0.4.5 were developed there. As of 0.4.6 Glide3xVK lives in this repo.
+
 > **Standalone repo** — this tree builds ONLY the glide3x.dll wrapper,
 > trimmed out of the `https://github.com/VTSTech/D2VP-QoL` superproject (no game source inside).
 > Build it with `cmake -S . -B build-g3x -G Ninja
