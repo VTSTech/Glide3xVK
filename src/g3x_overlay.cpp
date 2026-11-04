@@ -82,7 +82,7 @@ bool     s_fps_t0_valid   = false;
 // shader line (clears when no chain runs) and the toast (expires), it never
 // goes away, so every screenshot the overlay stamps also says where the
 // build came from.
-const char     k_credit[]   = "GitHub: VTSTech/D2LoD-libslang-vk";
+const char     k_credit[]   = "GitHub: VTSTech/Glide3xVK";
 const unsigned k_credit_len = sizeof(k_credit) - 1;
 
 // 0.4.2: second overlay line — the active slang preset's file name. Pushed
