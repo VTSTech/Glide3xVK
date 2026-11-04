@@ -1,7 +1,7 @@
 # glide3xvk — our own `glide3x.dll` for D2LoD (Glide 3 → Vulkan)
 
 > **Standalone repo** — this tree builds ONLY the glide3x.dll wrapper,
-> trimmed out of the `D2LoD-libslang-vk` superproject (no game source inside).
+> trimmed out of the `https://github.com/VTSTech/D2VP-QoL` superproject (no game source inside).
 > Build it with `cmake -S . -B build-g3x -G Ninja
 > -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-i686.cmake` and a `libslang-vk` checkout
 > beside it (see BUILD-32BIT.md); CI does exactly that on every push.
