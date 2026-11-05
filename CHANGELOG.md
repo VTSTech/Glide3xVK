@@ -7,6 +7,26 @@ Format follows Keep a Changelog. Where a field round already ran, entries cite w
 glide3x.log showed on real hardware (RX 560, Vulkan 1.3, windowed). Commit refs are on
 branch `libslang-vk` of VTSTech/D2LoD-libslang-vk.
 
+## [0.4.7] - 2026-11-05
+
+### Fixed
+
+- **1366x768 (game resolution mode 5) opened a 640x480 framebuffer** (g3x_types.h +
+  glide_exports.cpp): the game's R112 fifth slider stop sends `grSstWinOpen`
+  resolution enum **18**, but `g3x_resolution_size` only knew 0-17, so the stop took
+  the unknown-resolution fallback — a 640x480 swapchain and window while the game
+  lays out for 1366x768. Field shape: Glide fullscreen at the 1366x768 stop showed
+  only the top-left quarter of the frame, stretched ~2x over the host (D3D unaffected
+  — its mode table lives in d2vp.exe). Fix: table entry **18 = {1366, 768}**
+  (`0x556 x 0x300`), the unknown-resolution guard `> 17` → `> 18`, comment updated.
+  The stop now rides the exact path 16/17 (1280x720 / 1344x700) shipped on — same
+  swapchain sizing, same present, no other resolution-sensitive code touched.
+  Diagnosed from the game-side contract (D2Glide `screen_resolution = 18`, added in
+  the game's R112 with the wrapper entry-18 dependency flagged): the field
+  `glide3x.log` line for this bug is
+  `grSstWinOpen: unknown resolution 18 -> falling back 640x480`. Wrapper-side only;
+  pairs with game release `Vanilla+0.0.7-R113` (no game-side change needed).
+
 ## [0.4.6] - 2026-10-29
 
 ### Added

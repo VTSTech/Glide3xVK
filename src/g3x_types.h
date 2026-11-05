@@ -77,11 +77,16 @@ inline void g3x_resolution_size(GrScreenResolution_t res, unsigned* w, unsigned*
         {640, 350}, {640, 400}, {640, 480}, {800, 600}, {960, 720},
         {856, 480}, {512, 256}, {1024, 768}, {1280, 1024}, {1600, 1200},
         {400, 300},
-        // 16/17: Vanilla Plus stops passed by the 720p game branch
+        // 16/17/18: Vanilla Plus stops passed by the wide game branch
         // (D2Glide RENDERER_GLIDE_InitWindow): 16 = 1280x720 in-game,
-        // 17 = dormant 1344x700. Older game builds never send these; the
-        // >17 fallback below keeps 640x480 + log for genuinely unknown values.
-        {1280, 720}, {1344, 700}
+        // 17 = dormant 1344x700, 18 = 1366x768 (game R112's fifth slider
+        // stop, 0x556 x 0x300; the R114 wrapper round ships it — a pre-0.4.7
+        // wrapper fail-softs this stop to the 640x480 fallback below while
+        // the game lays out for 1366x768, i.e. the top-left quarter of the
+        // frame stretched over the host). Older game builds never send
+        // these; the >18 fallback below keeps 640x480 + log for genuinely
+        // unknown values.
+        {1280, 720}, {1344, 700}, {1366, 768}
     };
     if (res < sizeof(kRes) / sizeof(kRes[0])) {
         *w = kRes[res][0];
