@@ -9,6 +9,19 @@ branch `libslang-vk` of VTSTech/D2LoD-libslang-vk.
 
 ## [0.4.7] - 2026-11-05
 
+### Added
+
+- **1920x1080 (game resolution mode 6, the R115 sixth slider stop)** (g3x_types.h +
+  glide_exports.cpp): the game's 1080p round sends `grSstWinOpen` resolution enum
+  **19**; `g3x_resolution_size` gains entry **19 = {1920, 1080}** (`0x780 x 0x438`)
+  and the unknown-resolution guard moves `> 18` → `> 19`. The stop rides the exact
+  path 16/17/18 shipped on — same swapchain sizing, same present. 1080p is the most
+  universally listed CEA timing, so it almost always renders native; the wrapper
+  never touches the display mode either way (Glide is exempt from the game's D3D
+  stretch ladder by design). Pairs with game release `Vanilla+0.0.7-R115`; the host
+  check (`scripts/test_res18.cpp`) now also pins 19 and keeps the soft-fail pin
+  moved to 20/255.
+  
 ### Fixed
 
 - **1366x768 (game resolution mode 5) opened a 640x480 framebuffer** (g3x_types.h +

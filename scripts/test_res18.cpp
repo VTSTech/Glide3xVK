@@ -1,5 +1,6 @@
-// R114 host check: g3x_resolution_size must map the Vanilla Plus stops and
-// keep every stock enum byte-identical. Run: g++ -o /tmp/r114test scripts/test_res18.cpp
+// R114/R115 host check: g3x_resolution_size must map the Vanilla Plus stops
+// and keep every stock enum byte-identical.
+// Run: g++ -o /tmp/r114test scripts/test_res18.cpp
 #include "../src/g3x_types.h"
 #include <cstdio>
 
@@ -20,9 +21,10 @@ int main() {
     // Vanilla Plus stops
     expect(16, 1280, 720);  // mode 4, live since R108
     expect(17, 1344, 700);  // mode 3, dormant (R109)
-    expect(18, 1366, 768);  // mode 5, R112 fifth stop — the R114 fix
+    expect(18, 1366, 768);  // mode 5, R112 fifth stop (wrapper 0.4.7)
+    expect(19, 1920, 1080); // mode 6, R115 sixth stop (wrapper 0.4.8)
     // genuinely unknown: soft-fail must survive for future values
-    expect(19, 640, 480);
+    expect(20, 640, 480);
     expect(255, 640, 480);
     std::printf(fails ? "FAILED (%d)\n" : "ALL GREEN\n", fails);
     return fails != 0;

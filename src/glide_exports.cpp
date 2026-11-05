@@ -128,7 +128,7 @@ GrContext_t __stdcall grSstWinOpen(FxU32 hWnd, GrScreenResolution_t screen_resol
                                    int nAuxBuffers) {
     unsigned w = 0, h = 0;
     g3x_resolution_size(screen_resolution, &w, &h);
-    if (screen_resolution > 18) { // 16 = 1280x720, 17 = 1344x700, 18 = 1366x768 (Vanilla Plus stops)
+    if (screen_resolution > 19) { // 16 = 1280x720, 17 = 1344x700, 18 = 1366x768, 19 = 1920x1080 (Vanilla Plus stops)
         g3x_log("grSstWinOpen: unknown resolution %u -> falling back 640x480",
                 (unsigned)screen_resolution);
     }
