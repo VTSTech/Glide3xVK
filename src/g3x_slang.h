@@ -120,7 +120,14 @@ void g3x_slang_swapchain_resized(unsigned out_w, unsigned out_h, int swap_format
 // drawn) and render the chain into an acquired swapchain image, then present.
 // Returns true when THIS module handled the frame; false = caller must run
 // the legacy unfiltered present path.
-bool g3x_slang_present(const uint8_t* bgra, unsigned w, unsigned h);
+// Present through the preset chain. bgra = game-res BGRA frame (game res,
+// post-gamma). upload_buffer (CPU-route perf): optional VkBuffer of the
+// PERSISTENT host-visible TRANSFER_SRC staging already holding the frame —
+// when non-null the chain copies it into the input image inside its own
+// submit (no slangvk_image_update submit + fence wait); when null the
+// classic per-frame image_update feed runs.
+bool g3x_slang_present(const uint8_t* bgra, unsigned w, unsigned h,
+                       void* upload_buffer = nullptr);
 
 // True when the chain will take the next frame (gates g3x_frame_present's path).
 bool g3x_slang_active();

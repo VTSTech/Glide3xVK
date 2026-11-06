@@ -97,6 +97,14 @@ void* g3x_vk_slang_swap_view(uint32_t idx);        // VkImageView of swapchain i
 int   g3x_vk_slang_swap_format();                  // VkFormat of the swapchain images
 void  g3x_vk_slang_swap_extent(unsigned* w, unsigned* h);
 void* g3x_vk_slang_acquire_semaphore();            // the binary semaphore acquire signaled
+// Persistent host-visible TRANSFER_SRC staging for the chain's input feed
+// (CPU-route perf): the frame's gamma+overlay output is written straight into
+// the mapped buffer and handed to slangvk_input_frame::pixel_buffer, so the
+// chain copies it in its own submit — slangvk_image_update's separate
+// submit + fence wait + per-frame VMA staging alloc disappear. Allocates
+// once at game-res, regrows on resolution change; *vbuf is the VkBuffer,
+// *map the persistently mapped write pointer (w*h*4 bytes usable).
+bool  g3x_vk_slang_input_stage(unsigned w, unsigned h, void** map, void** vbuf);
 
 // 0.4.3 shader base resolution: one fenced one-shot submit that stretches the
 // game-res source image into the N-times larger input image (linear filter).

@@ -219,6 +219,8 @@ static unsigned s_n_vc0 = 0;          // P2.8: textured quads with (near-)unifor
                                       // BLACK vertex color — the shadow/darken
                                       // class; opaque-black rects unless chroma
                                       // punches their transparent texels
+static unsigned s_n_blit = 0;         // CPU-route perf: tile-class quads drawn
+                                      // through the blit_quad_exec fast path
 
 // ---- raster (math in g3x_raster_core.h; this TU keeps state + conversion) --
 using RVert    = g3xrc::RVert;
@@ -392,6 +394,27 @@ bool fill_rect_fast(unsigned count, const RVert* v) {
 // pin 2^lod/256 on both axes with 1:1 texel:pixel mapping.
 TexSpace tex_space(const RVert* /*v*/, unsigned /*n*/, const Tex& t) {
     return g3xrc::tex_space_lod(t.lod);   // (1u << lod) / 256.0f on both axes
+}
+
+// P13 perf (CPU route): the tile-class quad blit. Axis-aligned, integer-corner,
+// 1:1-mapped P8 quads with uniform vertex color — the ground/wall/UI class the
+// field frame mixes are made of — rasterize through g3xrc::blit_quad_exec's
+// integer inner loop instead of two barycentric triangles (no per-pixel float
+// u/v walk, no per-pixel edge/weight work, blend class hoisted). Everything
+// the exec cannot PROVE pixel-identical (fractional corners, non-1:1 mapping,
+// per-pixel vertex color, clipping, duplicated corners, RGB565 video quads)
+// returns false and keeps the exact path; the 16-frame corpus hash pin gates
+// the equivalence. raster=gpu skips it (the kernel owns the stream).
+static bool quad_blit_fast(unsigned count, const RVert* v, float tsx, float tsy, bool strip) {
+    if (s_gpu_emit || count != 4 || s_cur < 0) return false;
+    const Tex& t = s_tex[s_cur];
+    if (g3xrc::blit_quad_exec(g3xrc_host(), v,
+                              g3xrc::TexView{ t.data, t.w, t.h, t.lod, t.bpp },
+                              tsx, tsy, strip)) {
+        ++s_n_blit;
+        return true;
+    }
+    return false;
 }
 
 // Field diagnostic (round 10): the first quads per distinct (dims) class,
@@ -716,11 +739,11 @@ unsigned g3x_frame_tex_miss_count() {
     return s_tex_miss_total;
 }
 
-void g3x_frame_draw_stats(unsigned out[9]) {
+void g3x_frame_draw_stats(unsigned out[10]) {
     out[0] = s_n_vac; out[1] = s_n_parr; out[2] = s_n_parr_strip;
     out[3] = s_n_parr_fan; out[4] = s_n_skip_notex;
     out[5] = s_n_space256; out[6] = s_n_rgb565; out[7] = s_n_fill;
-    out[8] = s_n_vc0;
+    out[8] = s_n_vc0; out[9] = s_n_blit;
 }
 
 unsigned g3x_frame_chroma_toggles() {
@@ -777,6 +800,7 @@ void g3x_frame_draw_fan(unsigned count, const void* base, unsigned stride) {
                 verts[3].x, verts[3].y, verts[3].argb, verts[3].u, verts[3].v);
         ++s_dumped;
     }
+    if (quad_blit_fast(count, verts, tsx, tsy, false)) return;   // tile-class fast path
     for (unsigned i = 1; i + 1 < count; ++i) {
         rt_fire(verts[0], verts[i], verts[i + 1], tsx, tsy);
     }
@@ -824,6 +848,8 @@ void g3x_frame_draw_pointers(unsigned mode, unsigned count, void* const* pointer
                 verts[0].argb, verts[1].argb, verts[2].argb, verts[3].argb);
         ++s_pdumped;
     }
+    if ((mode == G3X_GR_TRIANGLE_FAN || mode == G3X_GR_TRIANGLE_STRIP) &&
+        quad_blit_fast(count, verts, tsx, tsy, mode == G3X_GR_TRIANGLE_STRIP)) return;
     if (mode == G3X_GR_TRIANGLE_FAN) {
         ++s_n_parr_fan;
         for (unsigned i = 1; i + 1 < count; ++i) {
@@ -1046,6 +1072,20 @@ bool g3x_frame_present() {
     // shape. The overlay is drawn at game res and filters along with the
     // frame (WYSIWYG); it still never touches the game's own framebuffer.
     if (g3x_slang_active()) {
+        // CPU-route perf: compose gamma + overlay straight into the chain's
+        // PERSISTENT upload staging and hand the VkBuffer to the chain — the
+        // slangvk_image_update submit + fence wait + its per-frame staging
+        // alloc all disappear (the chain copies the feed inside its own
+        // single submit; the sync render fences before the next frame writes
+        // the staging again). Any failure falls through to the classic
+        // slang_buf path below, so behavior never changes, only cost.
+        void* smap = nullptr; void* sbuf = nullptr;
+        if (g3x_vk_slang_input_stage(s_w, s_h, &smap, &sbuf)) {
+            gamma_scale_copy((uint8_t*)smap, s_w, s_h);
+            g3x_overlay_render((uint8_t*)smap, s_w, s_h);
+            if (g3x_slang_present((const uint8_t*)smap, s_w, s_h, sbuf)) return true;
+            g3x_log_once("slang-staged-fell", "staged chain feed failed this frame — classic path");
+        }
         static uint8_t* slang_buf = nullptr;
         static unsigned slang_cap = 0;
         const size_t sneed = (size_t)s_w * s_h * 4;

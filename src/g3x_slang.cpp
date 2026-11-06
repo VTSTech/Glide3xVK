@@ -1676,8 +1676,8 @@ static void shot_submit_and_report(const uint8_t* bgra, unsigned w, unsigned h) 
     }
 }
 
-bool g3x_slang_present(const uint8_t* bgra, unsigned w, unsigned h) {
-    if (!g3x_slang_active() || !bgra || !w || !h) return false;
+bool g3x_slang_present(const uint8_t* bgra, unsigned w, unsigned h, void* upload_buffer) {
+    if (!g3x_slang_active() || !w || !h || (!bgra && !upload_buffer)) return false;
     ++s_frame;
     g3x_slang_hotkeys_poll();
     hot_reload_tick();
@@ -1700,11 +1700,21 @@ bool g3x_slang_present(const uint8_t* bgra, unsigned w, unsigned h) {
         g3x_log("slang: input image %ux%u B8G8R8A8", w, h);
     }
 
-    const slangvk_result ur = slangvk_image_update(s_img, bgra, (size_t)w * h * 4);
-    if (ur != SLANGVK_OK) {
-        g3x_log_once("slang-upd", "slang: image_update failed (%s)",
-                     slangvk_result_name(ur));
-        return false;
+    if (upload_buffer && s_base_live <= 1) {
+        // staged feed (CPU-route perf, 1x only): the chain copies the
+        // persistent staging buffer into the input image inside its own
+        // submit — no separate upload submit, no fence wait, no per-frame
+        // VMA staging. At base_res > 1 the feed image is the UPSCALED
+        // s_img_up (the staging holds only the native frame, and the blit
+        // below must run from s_img), so those frames keep the classic
+        // image_update feed.
+    } else {
+        const slangvk_result ur = slangvk_image_update(s_img, bgra, (size_t)w * h * 4);
+        if (ur != SLANGVK_OK) {
+            g3x_log_once("slang-upd", "slang: image_update failed (%s)",
+                         slangvk_result_name(ur));
+            return false;
+        }
     }
 
     // 0.4.3: shader base resolution. 1x feeds s_img directly; N>1 lazily
@@ -1751,6 +1761,7 @@ bool g3x_slang_present(const uint8_t* bgra, unsigned w, unsigned h) {
     slangvk_input_frame in{};
     slangvk_image_get_handles(feed_img, &in.view, &in.image, &in.format, &in.width, &in.height);
     in.rotation = SLANGVK_ROTATION_NONE;
+    in.pixel_buffer = (upload_buffer && s_base_live <= 1) ? (VkBuffer)upload_buffer : VK_NULL_HANDLE;
 
     unsigned ew = 0, eh = 0;
     g3x_vk_slang_swap_extent(&ew, &eh);

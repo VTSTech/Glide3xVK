@@ -303,14 +303,14 @@ void __stdcall grBufferSwap(FxU32 swap_interval) {
     // tag budget-quiet, so these are the only evidence of what each phase
     // actually submitted (and how fast the CPU raster is keeping up).
     if (g_st.n_swaps % 120 == 0) {
-        unsigned ds[9];
+        unsigned ds[10];
         g3x_frame_draw_stats(ds);
         g3x_log("frame %u: avg=%.1fms work=%.1fms vac=%u parr=%u(strip=%u fan=%u) sub256=%u "
-                "rgb565=%u fill=%u vc0=%u skip=%u point=%u texdl=%u paldl=%u "
+                "rgb565=%u fill=%u vc0=%u blit=%u skip=%u point=%u texdl=%u paldl=%u "
                 "chm=%u lfb=%u",
                 g_st.n_swaps, s_ms_n ? s_ms_acc / (double)s_ms_n : 0.0,
                 s_work_n ? s_work_acc / (double)s_work_n : 0.0,
-                ds[0], ds[1], ds[2], ds[3], ds[4], ds[5], ds[6], ds[7], ds[8],
+                ds[0], ds[1], ds[2], ds[3], ds[4], ds[5], ds[6], ds[7], ds[8], ds[9],
                 g_st.n_point, g_st.n_tex_downloads, g_st.n_palette_downloads,
                 g3x_frame_chroma_toggles(), g_st.n_lfb_locks);
         s_ms_acc = 0.0; s_ms_n = 0;

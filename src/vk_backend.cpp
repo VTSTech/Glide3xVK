@@ -32,17 +32,31 @@ bool             s_sync_live  = false;
 // next present recreates the swapchain from fresh caps WITHOUT waiting for
 // the driver to raise OUT_OF_DATE (flaky on mixed-DPI-awareness windows).
 bool             s_refresh_requested = false;
-VkSemaphore      s_sem_acquire = VK_NULL_HANDLE;
-VkSemaphore      s_sem_render  = VK_NULL_HANDLE;
-VkFence          s_fence       = VK_NULL_HANDLE;
+// CPU-route perf: the present path runs as a 3-slot ring. Each slot owns a
+// command buffer, a fence, its acquire/render semaphore pair AND its own
+// host-visible upload staging (the GPU copy of slot N reads slot N's staging
+// while the CPU already composes frame N+1 — a single shared staging would
+// race). grBufferSwap no longer fence-waits the frame it just submitted; the
+// wait happens when the slot is REUSED (up to 2 frames later), so the GPU
+// copy/present of frame N overlaps the game's frame N+1 CPU work instead of
+// serializing inside the swap. The slang chain path keeps its own fenced
+// render and only borrows the slot's acquire semaphore.
+struct FrameSlot {
+    VkCommandBuffer cmd          = VK_NULL_HANDLE;
+    VkFence         fence        = VK_NULL_HANDLE;
+    VkSemaphore     acquire      = VK_NULL_HANDLE;
+    VkSemaphore     render       = VK_NULL_HANDLE;
+    VkBuffer        staging      = VK_NULL_HANDLE;
+    VkDeviceMemory  staging_mem  = VK_NULL_HANDLE;
+    uint8_t*        staging_map  = nullptr;
+    VkDeviceSize    staging_size = 0;
+    bool            fence_live   = false;  // a submit is pending on this slot's fence
+};
+constexpr unsigned kFrameSlots = 3;
+FrameSlot        s_slots[kFrameSlots] = {};
+unsigned         s_slot        = 0;   // the slot the CURRENT frame uses
 VkCommandPool    s_cmd_pool    = VK_NULL_HANDLE;
-VkCommandBuffer  s_cmd         = VK_NULL_HANDLE;
 uint64_t         s_frame       = 0;
-// host-visible upload buffer for the LFB/Bink present path (extent-sized)
-VkBuffer         s_staging      = VK_NULL_HANDLE;
-VkDeviceMemory   s_staging_mem  = VK_NULL_HANDLE;
-uint8_t*         s_staging_map  = nullptr;
-VkDeviceSize     s_staging_size = 0;
 // 0.4.6 PrintScreen: host-visible readback buffer for the presented-image
 // capture (extent-sized, allocated on the first shot, regrown on resize), and
 // whether the surface granted TRANSFER_SRC on the swapchain images at all.
@@ -51,6 +65,13 @@ VkDeviceMemory   s_readback_mem   = VK_NULL_HANDLE;
 uint8_t*         s_readback_map   = nullptr;
 VkDeviceSize     s_readback_size  = 0;
 bool             s_swap_src_ok    = false;
+
+// persistent host-visible upload buffer for the slang chain's input feed
+// (CPU-route perf, see vk_backend.h): survives frames, regrows on resize
+VkBuffer         s_in_stage      = VK_NULL_HANDLE;
+VkDeviceMemory   s_in_stage_mem  = VK_NULL_HANDLE;
+uint8_t*         s_in_stage_map  = nullptr;
+VkDeviceSize     s_in_stage_size = 0;
 
 #define G3X_VK_CHECK(expr, what)                                              \
     do {                                                                      \
@@ -64,56 +85,88 @@ bool             s_swap_src_ok    = false;
 void destroy_swapchain_objects() {
     if (s_device == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(s_device);
-    if (s_staging_map)      { vkUnmapMemory(s_device, s_staging_mem); s_staging_map = nullptr; }
-    if (s_staging)          { vkDestroyBuffer(s_device, s_staging, nullptr); s_staging = VK_NULL_HANDLE; }
-    if (s_staging_mem)      { vkFreeMemory(s_device, s_staging_mem, nullptr); s_staging_mem = VK_NULL_HANDLE; }
-    s_staging_size = 0;
     if (s_readback_map)     { vkUnmapMemory(s_device, s_readback_mem); s_readback_map = nullptr; }
     if (s_readback)         { vkDestroyBuffer(s_device, s_readback, nullptr); s_readback = VK_NULL_HANDLE; }
     if (s_readback_mem)     { vkFreeMemory(s_device, s_readback_mem, nullptr); s_readback_mem = VK_NULL_HANDLE; }
     s_readback_size = 0;
+    for (unsigned i = 0; i < kFrameSlots; ++i) {
+        FrameSlot& sl = s_slots[i];
+        if (sl.staging_map) { vkUnmapMemory(s_device, sl.staging_mem); sl.staging_map = nullptr; }
+        if (sl.staging)     { vkDestroyBuffer(s_device, sl.staging, nullptr); sl.staging = VK_NULL_HANDLE; }
+        if (sl.staging_mem) { vkFreeMemory(s_device, sl.staging_mem, nullptr); sl.staging_mem = VK_NULL_HANDLE; }
+        sl.staging_size = 0;
+        if (sl.fence)   { vkDestroyFence(s_device, sl.fence, nullptr); sl.fence = VK_NULL_HANDLE; }
+        if (sl.acquire) { vkDestroySemaphore(s_device, sl.acquire, nullptr); sl.acquire = VK_NULL_HANDLE; }
+        if (sl.render)  { vkDestroySemaphore(s_device, sl.render, nullptr); sl.render = VK_NULL_HANDLE; }
+        sl.cmd = VK_NULL_HANDLE;   // freed with the pool below
+        sl.fence_live = false;     // the old device's submit died with it
+    }
+    if (s_in_stage_map)     { vkUnmapMemory(s_device, s_in_stage_mem); s_in_stage_map = nullptr; }
+    if (s_in_stage)         { vkDestroyBuffer(s_device, s_in_stage, nullptr); s_in_stage = VK_NULL_HANDLE; }
+    if (s_in_stage_mem)     { vkFreeMemory(s_device, s_in_stage_mem, nullptr); s_in_stage_mem = VK_NULL_HANDLE; }
+    s_in_stage_size = 0;
     for (uint32_t i = 0; i < s_image_n; ++i) {
         if (s_views[i] != VK_NULL_HANDLE) { vkDestroyImageView(s_device, s_views[i], nullptr); s_views[i] = VK_NULL_HANDLE; }
     }
     if (s_swapchain != VK_NULL_HANDLE) { vkDestroySwapchainKHR(s_device, s_swapchain, nullptr); s_swapchain = VK_NULL_HANDLE; }
-    if (s_sem_acquire != VK_NULL_HANDLE) { vkDestroySemaphore(s_device, s_sem_acquire, nullptr); s_sem_acquire = VK_NULL_HANDLE; }
-    if (s_sem_render != VK_NULL_HANDLE)  { vkDestroySemaphore(s_device, s_sem_render, nullptr);  s_sem_render  = VK_NULL_HANDLE; }
-    if (s_fence != VK_NULL_HANDLE)       { vkDestroyFence(s_device, s_fence, nullptr);           s_fence       = VK_NULL_HANDLE; }
     if (s_cmd_pool != VK_NULL_HANDLE)    { vkDestroyCommandPool(s_device, s_cmd_pool, nullptr);  s_cmd_pool    = VK_NULL_HANDLE; }
     s_sync_live = false;
     s_image_n = 0;
+    s_slot = 0;
 }
 
 bool create_sync_and_cmd() {
     VkSemaphoreCreateInfo si{}; si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     VkFenceCreateInfo fi{}; fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    G3X_VK_CHECK(vkCreateSemaphore(s_device, &si, nullptr, &s_sem_acquire), "vkCreateSemaphore acquire");
-    G3X_VK_CHECK(vkCreateSemaphore(s_device, &si, nullptr, &s_sem_render),  "vkCreateSemaphore render");
-    G3X_VK_CHECK(vkCreateFence(s_device, &fi, nullptr, &s_fence), "vkCreateFence");
     VkCommandPoolCreateInfo pi{}; pi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pi.queueFamilyIndex = s_queue_fam;
     G3X_VK_CHECK(vkCreateCommandPool(s_device, &pi, nullptr, &s_cmd_pool), "vkCreateCommandPool");
     VkCommandBufferAllocateInfo ai{}; ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    ai.commandPool = s_cmd_pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
-    G3X_VK_CHECK(vkAllocateCommandBuffers(s_device, &ai, &s_cmd), "vkAllocateCommandBuffers");
+    ai.commandPool = s_cmd_pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = kFrameSlots;
+    VkCommandBuffer cmds[kFrameSlots] = {};
+    G3X_VK_CHECK(vkAllocateCommandBuffers(s_device, &ai, cmds), "vkAllocateCommandBuffers");
+    for (unsigned i = 0; i < kFrameSlots; ++i) {
+        FrameSlot& sl = s_slots[i];
+        G3X_VK_CHECK(vkCreateSemaphore(s_device, &si, nullptr, &sl.acquire), "vkCreateSemaphore acquire");
+        G3X_VK_CHECK(vkCreateSemaphore(s_device, &si, nullptr, &sl.render),  "vkCreateSemaphore render");
+        G3X_VK_CHECK(vkCreateFence(s_device, &fi, nullptr, &sl.fence), "vkCreateFence");
+        sl.cmd = cmds[i];
+    }
     s_sync_live = true;
     return true;
 }
 
-bool ensure_staging(VkDeviceSize bytes) {
-    if (s_staging && s_staging_size >= bytes) return true;
-    if (s_staging_map)      { vkUnmapMemory(s_device, s_staging_mem); s_staging_map = nullptr; }
-    if (s_staging)          { vkDestroyBuffer(s_device, s_staging, nullptr); s_staging = VK_NULL_HANDLE; }
-    if (s_staging_mem)      { vkFreeMemory(s_device, s_staging_mem, nullptr); s_staging_mem = VK_NULL_HANDLE; }
-    s_staging_size = 0;
+// Retire a slot before reuse: wait its fence (the up-to-2-frames-old submit
+// — the ring's ONLY host wait), reset fence + command buffer. Never called
+// on a fence that was not submitted.
+void slot_retire(FrameSlot& sl) {
+    if (sl.fence_live) {
+        vkWaitForFences(s_device, 1, &sl.fence, VK_TRUE, UINT64_MAX);
+        vkResetFences(s_device, 1, &sl.fence);
+        sl.fence_live = false;
+    }
+    vkResetCommandBuffer(sl.cmd, 0);
+}
+
+// Per-slot upload staging: the GPU copy submitted on slot i reads THIS
+// slot's buffer, so the CPU may compose the next frames into other slots'
+// buffers while it is in flight. Regrows on extent change (all slots sized
+// alike by the callers).
+bool ensure_slot_staging(FrameSlot& sl, VkDeviceSize bytes) {
+    if (sl.staging && sl.staging_size >= bytes) return true;
+    if (sl.staging_map)  { vkUnmapMemory(s_device, sl.staging_mem); sl.staging_map = nullptr; }
+    if (sl.staging)      { vkDestroyBuffer(s_device, sl.staging, nullptr); sl.staging = VK_NULL_HANDLE; }
+    if (sl.staging_mem)  { vkFreeMemory(s_device, sl.staging_mem, nullptr); sl.staging_mem = VK_NULL_HANDLE; }
+    sl.staging_size = 0;
 
     VkBufferCreateInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = bytes;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    G3X_VK_CHECK(vkCreateBuffer(s_device, &bi, nullptr, &s_staging), "vkCreateBuffer staging");
-    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(s_device, s_staging, &mr);
+    G3X_VK_CHECK(vkCreateBuffer(s_device, &bi, nullptr, &sl.staging), "vkCreateBuffer slot staging");
+    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(s_device, sl.staging, &mr);
     uint32_t mem_type = 0;
     {
         VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(s_phys, &mp);
@@ -125,15 +178,15 @@ bool ensure_staging(VkDeviceSize bytes) {
                 mem_type = i; found = true; break;
             }
         }
-        if (!found) { g3x_log("vk fail: no host-visible memory type"); return false; }
+        if (!found) { g3x_log("vk fail: no host-visible memory type (slot staging)"); return false; }
     }
     VkMemoryAllocateInfo ai{}; ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = mr.size; ai.memoryTypeIndex = mem_type;
-    G3X_VK_CHECK(vkAllocateMemory(s_device, &ai, nullptr, &s_staging_mem), "vkAllocateMemory staging");
-    G3X_VK_CHECK(vkBindBufferMemory(s_device, s_staging, s_staging_mem, 0), "vkBindBufferMemory staging");
-    G3X_VK_CHECK(vkMapMemory(s_device, s_staging_mem, 0, mr.size, 0, (void**)&s_staging_map),
-                 "vkMapMemory staging");
-    s_staging_size = mr.size;
+    G3X_VK_CHECK(vkAllocateMemory(s_device, &ai, nullptr, &sl.staging_mem), "vkAllocateMemory slot staging");
+    G3X_VK_CHECK(vkBindBufferMemory(s_device, sl.staging, sl.staging_mem, 0), "vkBindBufferMemory slot staging");
+    G3X_VK_CHECK(vkMapMemory(s_device, sl.staging_mem, 0, mr.size, 0, (void**)&sl.staging_map),
+                 "vkMapMemory slot staging");
+    sl.staging_size = mr.size;
     return true;
 }
 
@@ -146,6 +199,22 @@ bool ensure_readback(VkDeviceSize bytes) {
     if (s_readback)         { vkDestroyBuffer(s_device, s_readback, nullptr); s_readback = VK_NULL_HANDLE; }
     if (s_readback_mem)     { vkFreeMemory(s_device, s_readback_mem, nullptr); s_readback_mem = VK_NULL_HANDLE; }
     s_readback_size = 0;
+    for (unsigned i = 0; i < kFrameSlots; ++i) {
+        FrameSlot& sl = s_slots[i];
+        if (sl.staging_map) { vkUnmapMemory(s_device, sl.staging_mem); sl.staging_map = nullptr; }
+        if (sl.staging)     { vkDestroyBuffer(s_device, sl.staging, nullptr); sl.staging = VK_NULL_HANDLE; }
+        if (sl.staging_mem) { vkFreeMemory(s_device, sl.staging_mem, nullptr); sl.staging_mem = VK_NULL_HANDLE; }
+        sl.staging_size = 0;
+        if (sl.fence)   { vkDestroyFence(s_device, sl.fence, nullptr); sl.fence = VK_NULL_HANDLE; }
+        if (sl.acquire) { vkDestroySemaphore(s_device, sl.acquire, nullptr); sl.acquire = VK_NULL_HANDLE; }
+        if (sl.render)  { vkDestroySemaphore(s_device, sl.render, nullptr); sl.render = VK_NULL_HANDLE; }
+        sl.cmd = VK_NULL_HANDLE;   // freed with the pool below
+        sl.fence_live = false;     // the old device's submit died with it
+    }
+    if (s_in_stage_map)     { vkUnmapMemory(s_device, s_in_stage_mem); s_in_stage_map = nullptr; }
+    if (s_in_stage)         { vkDestroyBuffer(s_device, s_in_stage, nullptr); s_in_stage = VK_NULL_HANDLE; }
+    if (s_in_stage_mem)     { vkFreeMemory(s_device, s_in_stage_mem, nullptr); s_in_stage_mem = VK_NULL_HANDLE; }
+    s_in_stage_size = 0;
 
     VkBufferCreateInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = bytes;
@@ -261,8 +330,14 @@ bool create_swapchain() {
         G3X_VK_CHECK(vkCreateImageView(s_device, &vi, nullptr, &s_views[i]),
                      "vkCreateImageView");
     }
-    if (!ensure_staging((VkDeviceSize)s_extent.width * s_extent.height * 4)) return false;
     if (!s_sync_live && !create_sync_and_cmd()) return false;
+    // Pre-size every slot's upload staging at the new extent (the old shared
+    // staging allocated here too — before any acquire; present_pixels keeps
+    // a lazy grow as a safety net only).
+    for (unsigned i = 0; i < kFrameSlots; ++i) {
+        if (!ensure_slot_staging(s_slots[i], (VkDeviceSize)s_extent.width * s_extent.height * 4))
+            return false;
+    }
     // P3: let the preset chain retarget (slangvk_chain_resize) to the new extent.
     g3x_slang_swapchain_resized(s_extent.width, s_extent.height, (int)s_format);
     return true;
@@ -399,8 +474,14 @@ bool acquire_image(uint32_t* idx) {
         if (!g3x_vk_resize(g_vk.width, g_vk.height)) return false;
     }
     if (!g_vk.alive || !s_sync_live) return false;
+    FrameSlot& sl = s_slots[s_slot];
+    // The ring's only host wait: this slot's previous submit (up to 2 frames
+    // old) must retire before its fence, command buffer, semaphores and
+    // staging are reused. In the common case the fence has long signaled and
+    // this returns instantly; it doubles as the backpressure cap.
+    slot_retire(sl);
     VkResult r = vkAcquireNextImageKHR(s_device, s_swapchain, UINT64_MAX,
-                                       s_sem_acquire, VK_NULL_HANDLE, idx);
+                                       sl.acquire, VK_NULL_HANDLE, idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         g3x_log_once("swap-oode", "swapchain out of date, recreating");
         g3x_vk_resize(g_vk.width, g_vk.height);
@@ -426,11 +507,12 @@ void transfer_barriers_to_dst(uint32_t idx) {
     bar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     bar.srcAccessMask = 0;
     bar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    vkCmdPipelineBarrier(s_slots[s_slot].cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
 }
 
 void submit_and_present(uint32_t idx) {
+    FrameSlot& sl = s_slots[s_slot];
     VkImageMemoryBarrier bar{}; bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     bar.image = s_images[idx];
     bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -442,22 +524,26 @@ void submit_and_present(uint32_t idx) {
     bar.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     bar.dstAccessMask = 0;
-    vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    vkCmdPipelineBarrier(sl.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
-    vkEndCommandBuffer(s_cmd);
+    vkEndCommandBuffer(sl.cmd);
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo sub{}; sub.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    sub.waitSemaphoreCount = 1; sub.pWaitSemaphores = &s_sem_acquire;
+    sub.waitSemaphoreCount = 1; sub.pWaitSemaphores = &sl.acquire;
     sub.pWaitDstStageMask = &wait_stage;
-    sub.commandBufferCount = 1; sub.pCommandBuffers = &s_cmd;
-    sub.signalSemaphoreCount = 1; sub.pSignalSemaphores = &s_sem_render;
-    vkQueueSubmit(s_queue, 1, &sub, s_fence);
-    vkWaitForFences(s_device, 1, &s_fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(s_device, 1, &s_fence);
+    sub.commandBufferCount = 1; sub.pCommandBuffers = &sl.cmd;
+    sub.signalSemaphoreCount = 1; sub.pSignalSemaphores = &sl.render;
+    // CPU-route perf: submit WITHOUT the fence wait — the frame's GPU copy +
+    // present now overlap the game's next-frame CPU raster instead of
+    // serializing inside grBufferSwap. The fence is waited when THIS slot
+    // comes around again (slot_retire in acquire_image), which also guards
+    // the reuse of this slot's staging buffer.
+    vkQueueSubmit(s_queue, 1, &sub, sl.fence);
+    sl.fence_live = true;
 
     VkPresentInfoKHR pi{}; pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s_sem_render;
+    pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &sl.render;
     pi.swapchainCount = 1; pi.pSwapchains = &s_swapchain;
     pi.pImageIndices = &idx;
     VkResult r = vkQueuePresentKHR(s_queue, &pi);
@@ -465,6 +551,7 @@ void submit_and_present(uint32_t idx) {
         g3x_log_once("swap-oode2", "present out of date, recreating");
         g3x_vk_resize(g_vk.width, g_vk.height);
     }
+    s_slot = (s_slot + 1) % kFrameSlots;
 }
 
 } // namespace
@@ -476,7 +563,7 @@ void g3x_vk_present(unsigned swap_interval) {
 
     VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(s_cmd, &bi);
+    vkBeginCommandBuffer(s_slots[s_slot].cmd, &bi);
     transfer_barriers_to_dst(idx);
 
     // P1 frame content: solid black. P3 replaces this command buffer with the
@@ -484,7 +571,7 @@ void g3x_vk_present(unsigned swap_interval) {
     VkClearColorValue black{}; black.float32[3] = 1.f;
     VkImageSubresourceRange rng{};
     rng.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; rng.levelCount = 1; rng.layerCount = 1;
-    vkCmdClearColorImage(s_cmd, s_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    vkCmdClearColorImage(s_slots[s_slot].cmd, s_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          &black, 1, &rng);
 
     (void)swap_interval; // FIFO is always on in P1; immediate mode is P2 polish
@@ -500,24 +587,28 @@ bool g3x_vk_present_pixels(const uint8_t* bgra, unsigned w, unsigned h) {
     ++s_frame;
     if (!g_vk.alive || !s_sync_live) return false;
     if (w != s_extent.width || h != s_extent.height) return false; // stale compose buffer
-    VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
-    if (!ensure_staging(bytes) || !s_staging_map) return false;
+    // Acquire FIRST: it retires this slot (fence wait) before its staging is
+    // refilled — with the ring the previous frames' copies may still read
+    // their OWN slot's staging, so every slot keeps a private buffer.
+    uint32_t idx = 0;
+    if (!acquire_image(&idx)) return false;
+    FrameSlot& sl = s_slots[s_slot];
+    const VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
+    if (!ensure_slot_staging(sl, bytes) || !sl.staging_map) return false;
 
     if (s_format == VK_FORMAT_B8G8R8A8_UNORM) {
-        memcpy(s_staging_map, bgra, (size_t)bytes);
+        memcpy(sl.staging_map, bgra, (size_t)bytes);
     } else {
         // rare surface format (e.g. RGBA8): swizzle BGRA -> RGBA while uploading
-        const uint8_t* s = bgra; uint8_t* d = s_staging_map;
+        const uint8_t* s = bgra; uint8_t* d = sl.staging_map;
         for (VkDeviceSize i = 0; i < w * h; ++i, s += 4, d += 4) {
             d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
         }
     }
 
-    uint32_t idx = 0;
-    if (!acquire_image(&idx)) return false;
     VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(s_cmd, &bi);
+    vkBeginCommandBuffer(sl.cmd, &bi);
     transfer_barriers_to_dst(idx);
 
     VkBufferImageCopy cpy{};
@@ -526,7 +617,7 @@ bool g3x_vk_present_pixels(const uint8_t* bgra, unsigned w, unsigned h) {
     cpy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     cpy.imageSubresource.layerCount = 1;
     cpy.imageExtent = {s_extent.width, s_extent.height, 1};
-    vkCmdCopyBufferToImage(s_cmd, s_staging, s_images[idx],
+    vkCmdCopyBufferToImage(sl.cmd, sl.staging, s_images[idx],
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cpy);
 
     submit_and_present(idx);
@@ -550,6 +641,51 @@ void g3x_vk_shutdown() {
 
 bool g3x_vk_slang_ready() { return g_vk.alive && s_sync_live; }
 
+bool g3x_vk_slang_input_stage(unsigned w, unsigned h, void** map, void** vbuf) {
+    if (!g_vk.alive || !s_sync_live || !w || !h) return false;
+    const VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
+    if (s_in_stage && s_in_stage_size >= bytes) {
+        if (map) *map = s_in_stage_map;
+        if (vbuf) *vbuf = (void*)s_in_stage;
+        return true;
+    }
+    if (s_in_stage_map)  { vkUnmapMemory(s_device, s_in_stage_mem); s_in_stage_map = nullptr; }
+    if (s_in_stage)      { vkDestroyBuffer(s_device, s_in_stage, nullptr); s_in_stage = VK_NULL_HANDLE; }
+    if (s_in_stage_mem)  { vkFreeMemory(s_device, s_in_stage_mem, nullptr); s_in_stage_mem = VK_NULL_HANDLE; }
+    s_in_stage_size = 0;
+
+    VkBufferCreateInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bi.size = bytes;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    G3X_VK_CHECK(vkCreateBuffer(s_device, &bi, nullptr, &s_in_stage), "vkCreateBuffer in_stage");
+    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(s_device, s_in_stage, &mr);
+    uint32_t mem_type = 0;
+    {
+        VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(s_phys, &mp);
+        bool found = false;
+        for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+            if ((mr.memoryTypeBits & (1u << i)) &&
+                (mp.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))) {
+                mem_type = i; found = true; break;
+            }
+        }
+        if (!found) { g3x_log("vk fail: no host-visible memory type (in_stage)"); return false; }
+    }
+    VkMemoryAllocateInfo ai{}; ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = mr.size; ai.memoryTypeIndex = mem_type;
+    G3X_VK_CHECK(vkAllocateMemory(s_device, &ai, nullptr, &s_in_stage_mem), "vkAllocateMemory in_stage");
+    G3X_VK_CHECK(vkBindBufferMemory(s_device, s_in_stage, s_in_stage_mem, 0), "vkBindBufferMemory in_stage");
+    G3X_VK_CHECK(vkMapMemory(s_device, s_in_stage_mem, 0, mr.size, 0, (void**)&s_in_stage_map),
+                 "vkMapMemory in_stage");
+    s_in_stage_size = mr.size;
+    if (map) *map = s_in_stage_map;
+    if (vbuf) *vbuf = (void*)s_in_stage;
+    g3x_log("vk: slang input stage %ux%u ready", w, h);
+    return true;
+}
+
 bool g3x_vk_slang_acquire(uint32_t* idx) { return acquire_image(idx); }
 
 void g3x_vk_slang_present_acquired(uint32_t idx) {
@@ -563,6 +699,10 @@ void g3x_vk_slang_present_acquired(uint32_t idx) {
         g3x_log_once("swap-oode3", "present (slang) out of date, recreating");
         g3x_vk_resize(g_vk.width, g_vk.height);
     }
+    // The slang path consumed this slot's acquire semaphore (the chain waited
+    // it) and never touches the slot's fence — advance the ring so the next
+    // legacy frame uses the next slot (its retire never waits a cold fence).
+    s_slot = (s_slot + 1) % kFrameSlots;
 }
 
 void* g3x_vk_slang_swap_view(uint32_t idx) {
@@ -596,9 +736,11 @@ const uint8_t* g3x_vk_slang_readback_acquired(uint32_t idx) {
     const VkDeviceSize bytes = (VkDeviceSize)s_extent.width * s_extent.height * 4;
     if (!ensure_readback(bytes) || !s_readback_map) return nullptr;
 
+    FrameSlot& sl = s_slots[s_slot];
+    slot_retire(sl);   // the slot's cmd buffer + fence must be idle before reuse
     VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(s_cmd, &bi) != VK_SUCCESS) return nullptr;
+    if (vkBeginCommandBuffer(sl.cmd, &bi) != VK_SUCCESS) return nullptr;
 
     // PRESENT_SRC -> TRANSFER_SRC. srcAccessMask MUST be 0 coming out of
     // PRESENT_SRC (no access is guaranteed under it); ALL_COMMANDS covers the
@@ -614,7 +756,7 @@ const uint8_t* g3x_vk_slang_readback_acquired(uint32_t idx) {
     to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     to_src.srcAccessMask = 0;
     to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    vkCmdPipelineBarrier(sl.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
 
     VkBufferImageCopy cpy{};
@@ -623,7 +765,7 @@ const uint8_t* g3x_vk_slang_readback_acquired(uint32_t idx) {
     cpy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     cpy.imageSubresource.layerCount = 1;
     cpy.imageExtent = {s_extent.width, s_extent.height, 1};
-    vkCmdCopyImageToBuffer(s_cmd, s_images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    vkCmdCopyImageToBuffer(sl.cmd, s_images[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            s_readback, 1, &cpy);
 
     // TRANSFER_SRC -> PRESENT_SRC: the present still gets the layout it
@@ -634,15 +776,15 @@ const uint8_t* g3x_vk_slang_readback_acquired(uint32_t idx) {
     to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     to_present.dstAccessMask = 0;
-    vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    vkCmdPipelineBarrier(sl.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_present);
-    if (vkEndCommandBuffer(s_cmd) != VK_SUCCESS) return nullptr;
+    if (vkEndCommandBuffer(sl.cmd) != VK_SUCCESS) return nullptr;
 
     VkSubmitInfo sub{}; sub.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    sub.commandBufferCount = 1; sub.pCommandBuffers = &s_cmd;
-    if (vkQueueSubmit(s_queue, 1, &sub, s_fence) != VK_SUCCESS) return nullptr;
-    if (vkWaitForFences(s_device, 1, &s_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return nullptr;
-    vkResetFences(s_device, 1, &s_fence);
+    sub.commandBufferCount = 1; sub.pCommandBuffers = &sl.cmd;
+    if (vkQueueSubmit(s_queue, 1, &sub, sl.fence) != VK_SUCCESS) return nullptr;
+    if (vkWaitForFences(s_device, 1, &sl.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return nullptr;
+    vkResetFences(s_device, 1, &sl.fence);   // synchronous: consumed immediately
 
     // Rare non-BGRA surface (e.g. RGBA8): swizzle in place so the PNG encoder
     // keeps its BGRA contract (the same swap present_pixels does on upload).
@@ -671,17 +813,18 @@ bool g3x_vk_present_image(void* ud, g3x_vk_present_record_fn record,
     if (!g_vk.alive || !s_sync_live || !record || !src_image) return false;
     uint32_t idx = 0;
     if (!acquire_image(&idx)) return false;
+    FrameSlot& sl = s_slots[s_slot];
     VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(s_cmd, &bi);
+    vkBeginCommandBuffer(sl.cmd, &bi);
     transfer_barriers_to_dst(idx);
-    record(ud, (void*)s_cmd, (void*)s_images[idx], s_extent.width, s_extent.height);
+    record(ud, (void*)sl.cmd, (void*)s_images[idx], s_extent.width, s_extent.height);
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[1] = {(int32_t)sw, (int32_t)sh, 1};
     blit.dstOffsets[1] = {(int32_t)s_extent.width, (int32_t)s_extent.height, 1};
-    vkCmdBlitImage(s_cmd, (VkImage)src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    vkCmdBlitImage(sl.cmd, (VkImage)src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    s_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                    1, &blit, VK_FILTER_NEAREST);
     submit_and_present(idx);
@@ -695,7 +838,7 @@ void g3x_vk_slang_swap_extent(unsigned* w, unsigned* h) {
     if (h) *h = s_extent.height;
 }
 
-void* g3x_vk_slang_acquire_semaphore() { return (void*)s_sem_acquire; }
+void* g3x_vk_slang_acquire_semaphore() { return (void*)s_slots[s_slot].acquire; }
 
 bool g3x_vk_slang_blit_scaled(void* src_image, void* dst_image,
                               unsigned sw, unsigned sh, unsigned dw, unsigned dh) {
@@ -746,26 +889,28 @@ bool g3x_vk_slang_blit_scaled(void* src_image, void* dst_image,
     blit.srcOffsets[1] = {(int32_t)sw, (int32_t)sh, 1};
     blit.dstOffsets[1] = {(int32_t)dw, (int32_t)dh, 1};
 
+    FrameSlot& sl = s_slots[s_slot];
+    slot_retire(sl);   // the slot's cmd buffer + fence must be idle before reuse
     VkCommandBufferBeginInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(s_cmd, &bi) != VK_SUCCESS) return false;
+    if (vkBeginCommandBuffer(sl.cmd, &bi) != VK_SUCCESS) return false;
     VkImageMemoryBarrier enter[2] = {to_src, to_dst};
-    vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    vkCmdPipelineBarrier(sl.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                          2, enter);
-    vkCmdBlitImage(s_cmd, (VkImage)src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    vkCmdBlitImage(sl.cmd, (VkImage)src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    (VkImage)dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                    1, &blit, VK_FILTER_LINEAR);
     VkImageMemoryBarrier leave[2] = {back_src, back_dst};
-    vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    vkCmdPipelineBarrier(sl.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
                          2, leave);
-    if (vkEndCommandBuffer(s_cmd) != VK_SUCCESS) return false;
+    if (vkEndCommandBuffer(sl.cmd) != VK_SUCCESS) return false;
 
     VkSubmitInfo sub{}; sub.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    sub.commandBufferCount = 1; sub.pCommandBuffers = &s_cmd;
-    if (vkQueueSubmit(s_queue, 1, &sub, s_fence) != VK_SUCCESS) return false;
-    if (vkWaitForFences(s_device, 1, &s_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
-    vkResetFences(s_device, 1, &s_fence);
+    sub.commandBufferCount = 1; sub.pCommandBuffers = &sl.cmd;
+    if (vkQueueSubmit(s_queue, 1, &sub, sl.fence) != VK_SUCCESS) return false;
+    if (vkWaitForFences(s_device, 1, &sl.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+    vkResetFences(s_device, 1, &sl.fence);   // synchronous: consumed immediately
     return true;
 }

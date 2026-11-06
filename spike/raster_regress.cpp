@@ -58,7 +58,12 @@ bool g3x_shot_submit(const uint8_t*, unsigned, unsigned, char* name, unsigned) {
     return false;
 }
 bool g3x_slang_active() { return false; }
-bool g3x_slang_present(const uint8_t*, unsigned, unsigned) { return false; }
+bool g3x_slang_present(const uint8_t*, unsigned, unsigned, void*) { return false; }
+bool g3x_vk_slang_input_stage(unsigned, unsigned, void** map, void** buf) {
+    if (map) *map = nullptr;
+    if (buf) *buf = nullptr;
+    return false;
+}
 void g3x_slang_conf_panel_poll() {}
 void g3x_vk_present_extent(unsigned* w, unsigned* h) { *w = 0; *h = 0; }
 bool g3x_vk_present_pixels(const uint8_t*, unsigned, unsigned) { return false; }

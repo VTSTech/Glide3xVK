@@ -152,7 +152,9 @@ target_link_options(glide3x PRIVATE
 # any rig that runs a Vulkan driver (Pentium 4 / Athlon 64, 2003+).
 # glide3x target only: the game tree and the libslang-vk subbuild keep their
 # own flags.
-target_compile_options(glide3x PRIVATE -O2 -msse2 -mfpmath=sse -w)
+# CPU-route perf round 2: -O3 for our TUs (the raster inner loops + the
+# present-path copies; volk is flag-agnostic). SSE2 float math stays (P2.12).
+target_compile_options(glide3x PRIVATE -O3 -msse2 -mfpmath=sse -w)
 
 set_source_files_properties(src/glide_exports.cpp PROPERTIES
     COMPILE_DEFINITIONS "G3XVK_BUILD_ID=\"${G3XVK_BUILD_ID}\"")
