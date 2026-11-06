@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: VTSTech/libslang-vk
-          ref: d208ac59d2756b714e34d502727f46fe0f7aaa7e
+          ref: 8df93fcc7beff37c3695efd82cc7d9c0bd99fa4f
           path: libslang-vk
 
       - name: Install the toolchain
