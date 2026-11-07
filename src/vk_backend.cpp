@@ -66,12 +66,21 @@ uint8_t*         s_readback_map   = nullptr;
 VkDeviceSize     s_readback_size  = 0;
 bool             s_swap_src_ok    = false;
 
-// persistent host-visible upload buffer for the slang chain's input feed
-// (CPU-route perf, see vk_backend.h): survives frames, regrows on resize
-VkBuffer         s_in_stage      = VK_NULL_HANDLE;
-VkDeviceMemory   s_in_stage_mem  = VK_NULL_HANDLE;
-uint8_t*         s_in_stage_map  = nullptr;
-VkDeviceSize     s_in_stage_size = 0;
+// persistent host-visible upload buffers for the slang chain's input feed
+// (CPU-route perf, see vk_backend.h): survive frames, regrow on resize.
+// TWO rotating slots: the async chain render (G3XVK_SLANGVK_ASYNC) reads slot
+// A on the GPU while the game thread already composes the NEXT frame into
+// slot B — the same double-buffer rule the chain contract requires for
+// host-owned pixel buffers. With the synchronous render the second slot is
+// simply never contended. Rotation is one step per g3x_vk_slang_input_stage
+// call (exactly one per presented frame), so a caller that loses count only
+// wastes a swap of freshness, never mixes frames.
+constexpr unsigned kInStageSlots = 2;
+VkBuffer         s_in_stage[kInStageSlots]      = {};
+VkDeviceMemory   s_in_stage_mem[kInStageSlots]  = {};
+uint8_t*         s_in_stage_map[kInStageSlots]  = {};
+VkDeviceSize     s_in_stage_size[kInStageSlots] = {};
+unsigned         s_in_stage_turn                = 0;
 
 #define G3X_VK_CHECK(expr, what)                                              \
     do {                                                                      \
@@ -101,10 +110,13 @@ void destroy_swapchain_objects() {
         sl.cmd = VK_NULL_HANDLE;   // freed with the pool below
         sl.fence_live = false;     // the old device's submit died with it
     }
-    if (s_in_stage_map)     { vkUnmapMemory(s_device, s_in_stage_mem); s_in_stage_map = nullptr; }
-    if (s_in_stage)         { vkDestroyBuffer(s_device, s_in_stage, nullptr); s_in_stage = VK_NULL_HANDLE; }
-    if (s_in_stage_mem)     { vkFreeMemory(s_device, s_in_stage_mem, nullptr); s_in_stage_mem = VK_NULL_HANDLE; }
-    s_in_stage_size = 0;
+    for (unsigned i = 0; i < kInStageSlots; ++i) {
+        if (s_in_stage_map[i]) { vkUnmapMemory(s_device, s_in_stage_mem[i]); s_in_stage_map[i] = nullptr; }
+        if (s_in_stage[i])     { vkDestroyBuffer(s_device, s_in_stage[i], nullptr); s_in_stage[i] = VK_NULL_HANDLE; }
+        if (s_in_stage_mem[i]) { vkFreeMemory(s_device, s_in_stage_mem[i], nullptr); s_in_stage_mem[i] = VK_NULL_HANDLE; }
+        s_in_stage_size[i] = 0;
+    }
+    s_in_stage_turn = 0;
     for (uint32_t i = 0; i < s_image_n; ++i) {
         if (s_views[i] != VK_NULL_HANDLE) { vkDestroyImageView(s_device, s_views[i], nullptr); s_views[i] = VK_NULL_HANDLE; }
     }
@@ -211,10 +223,13 @@ bool ensure_readback(VkDeviceSize bytes) {
         sl.cmd = VK_NULL_HANDLE;   // freed with the pool below
         sl.fence_live = false;     // the old device's submit died with it
     }
-    if (s_in_stage_map)     { vkUnmapMemory(s_device, s_in_stage_mem); s_in_stage_map = nullptr; }
-    if (s_in_stage)         { vkDestroyBuffer(s_device, s_in_stage, nullptr); s_in_stage = VK_NULL_HANDLE; }
-    if (s_in_stage_mem)     { vkFreeMemory(s_device, s_in_stage_mem, nullptr); s_in_stage_mem = VK_NULL_HANDLE; }
-    s_in_stage_size = 0;
+    for (unsigned i = 0; i < kInStageSlots; ++i) {
+        if (s_in_stage_map[i]) { vkUnmapMemory(s_device, s_in_stage_mem[i]); s_in_stage_map[i] = nullptr; }
+        if (s_in_stage[i])     { vkDestroyBuffer(s_device, s_in_stage[i], nullptr); s_in_stage[i] = VK_NULL_HANDLE; }
+        if (s_in_stage_mem[i]) { vkFreeMemory(s_device, s_in_stage_mem[i], nullptr); s_in_stage_mem[i] = VK_NULL_HANDLE; }
+        s_in_stage_size[i] = 0;
+    }
+    s_in_stage_turn = 0;
 
     VkBufferCreateInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = bytes;
@@ -644,22 +659,28 @@ bool g3x_vk_slang_ready() { return g_vk.alive && s_sync_live; }
 bool g3x_vk_slang_input_stage(unsigned w, unsigned h, void** map, void** vbuf) {
     if (!g_vk.alive || !s_sync_live || !w || !h) return false;
     const VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
-    if (s_in_stage && s_in_stage_size >= bytes) {
-        if (map) *map = s_in_stage_map;
-        if (vbuf) *vbuf = (void*)s_in_stage;
+    // Rotate first, then hand out THIS call's slot: one call per presented
+    // frame — with the async chain the PREVIOUS call's buffer may still be
+    // read by the in-flight chain submit, so consecutive frames must land on
+    // different slots (kInStageSlots = 2 covers framesInFlight = 1 exactly).
+    s_in_stage_turn = (s_in_stage_turn + 1) % kInStageSlots;
+    const unsigned t = s_in_stage_turn;
+    if (s_in_stage[t] && s_in_stage_size[t] >= bytes) {
+        if (map) *map = s_in_stage_map[t];
+        if (vbuf) *vbuf = (void*)s_in_stage[t];
         return true;
     }
-    if (s_in_stage_map)  { vkUnmapMemory(s_device, s_in_stage_mem); s_in_stage_map = nullptr; }
-    if (s_in_stage)      { vkDestroyBuffer(s_device, s_in_stage, nullptr); s_in_stage = VK_NULL_HANDLE; }
-    if (s_in_stage_mem)  { vkFreeMemory(s_device, s_in_stage_mem, nullptr); s_in_stage_mem = VK_NULL_HANDLE; }
-    s_in_stage_size = 0;
+    if (s_in_stage_map[t])  { vkUnmapMemory(s_device, s_in_stage_mem[t]); s_in_stage_map[t] = nullptr; }
+    if (s_in_stage[t])      { vkDestroyBuffer(s_device, s_in_stage[t], nullptr); s_in_stage[t] = VK_NULL_HANDLE; }
+    if (s_in_stage_mem[t])  { vkFreeMemory(s_device, s_in_stage_mem[t], nullptr); s_in_stage_mem[t] = VK_NULL_HANDLE; }
+    s_in_stage_size[t] = 0;
 
     VkBufferCreateInfo bi{}; bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bi.size = bytes;
     bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    G3X_VK_CHECK(vkCreateBuffer(s_device, &bi, nullptr, &s_in_stage), "vkCreateBuffer in_stage");
-    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(s_device, s_in_stage, &mr);
+    G3X_VK_CHECK(vkCreateBuffer(s_device, &bi, nullptr, &s_in_stage[t]), "vkCreateBuffer in_stage");
+    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(s_device, s_in_stage[t], &mr);
     uint32_t mem_type = 0;
     {
         VkPhysicalDeviceMemoryProperties mp{}; vkGetPhysicalDeviceMemoryProperties(s_phys, &mp);
@@ -675,14 +696,14 @@ bool g3x_vk_slang_input_stage(unsigned w, unsigned h, void** map, void** vbuf) {
     }
     VkMemoryAllocateInfo ai{}; ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = mr.size; ai.memoryTypeIndex = mem_type;
-    G3X_VK_CHECK(vkAllocateMemory(s_device, &ai, nullptr, &s_in_stage_mem), "vkAllocateMemory in_stage");
-    G3X_VK_CHECK(vkBindBufferMemory(s_device, s_in_stage, s_in_stage_mem, 0), "vkBindBufferMemory in_stage");
-    G3X_VK_CHECK(vkMapMemory(s_device, s_in_stage_mem, 0, mr.size, 0, (void**)&s_in_stage_map),
+    G3X_VK_CHECK(vkAllocateMemory(s_device, &ai, nullptr, &s_in_stage_mem[t]), "vkAllocateMemory in_stage");
+    G3X_VK_CHECK(vkBindBufferMemory(s_device, s_in_stage[t], s_in_stage_mem[t], 0), "vkBindBufferMemory in_stage");
+    G3X_VK_CHECK(vkMapMemory(s_device, s_in_stage_mem[t], 0, mr.size, 0, (void**)&s_in_stage_map[t]),
                  "vkMapMemory in_stage");
-    s_in_stage_size = mr.size;
-    if (map) *map = s_in_stage_map;
-    if (vbuf) *vbuf = (void*)s_in_stage;
-    g3x_log("vk: slang input stage %ux%u ready", w, h);
+    s_in_stage_size[t] = mr.size;
+    if (map) *map = s_in_stage_map[t];
+    if (vbuf) *vbuf = (void*)s_in_stage[t];
+    g3x_log("vk: slang input stage %ux%u ready (slot %u/%u)", w, h, t + 1, kInStageSlots);
     return true;
 }
 

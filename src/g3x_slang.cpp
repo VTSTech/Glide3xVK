@@ -1683,6 +1683,25 @@ bool g3x_slang_present(const uint8_t* bgra, unsigned w, unsigned h, void* upload
     hot_reload_tick();
     if (!g3x_slang_active()) return false;        // hot reload may have torn it down
 
+#ifdef G3XVK_SLANGVK_ASYNC
+    // Async chain render: the PREVIOUS frame's chain submit may still be
+    // executing on the GPU. The steady-state 1x staged feed needs no wait —
+    // its upload rides INSIDE this frame's chain submit, and render_async's
+    // slot wait orders it after the previous frame retired. Every other feed
+    // (classic image_update, the base-res blit, and any input-image teardown)
+    // touches the input image on the host timeline, so the chain must be
+    // drained first. Cost in the steady state: zero (the wait returns
+    // instantly once the GPU has caught up; it is the backpressure otherwise).
+    const bool staged_1x_steady = (upload_buffer != nullptr && s_base_live <= 1 &&
+                                   s_img && s_img_w == w && s_img_h == h);
+    if (!staged_1x_steady) {
+        const slangvk_result wr = slangvk_chain_wait_idle(s_chain);
+        if (wr != SLANGVK_OK)
+            g3x_log_once("slang-waitidle", "slang: chain_wait_idle failed (%s)",
+                         slangvk_result_name(wr));
+    }
+#endif
+
     // (Re)create the input image when the game resolution changed.
     if (!s_img || s_img_w != w || s_img_h != h) {
         if (s_img) { slangvk_image_destroy(s_img); s_img = nullptr; }
@@ -1782,7 +1801,23 @@ bool g3x_slang_present(const uint8_t* bgra, unsigned w, unsigned h, void* upload
     fi.frame_delta_us = 16666.0f;                 // ~60 Hz reference; presets only ease with it
     fi.frame_direction = +1;
 
-    const slangvk_result rr = slangvk_chain_render_swapchain(s_chain, &in, &out, &fi);
+#ifdef G3XVK_SLANGVK_ASYNC
+    VkFence async_fence = VK_NULL_HANDLE;         // chain-owned; retired by the next render/wait_idle
+#endif
+
+    const slangvk_result rr =
+#ifdef G3XVK_SLANGVK_ASYNC
+    // Submit and return: the chain's GPU work (5+ passes at 1080p — the
+    // ~23 ms the field log measured inside work=) now overlaps the game's
+    // next-frame CPU loop instead of blocking inside grBufferSwap. The
+    // fence is chain-owned; the next render or wait_idle reclaims it. The
+    // present below is enqueued on the SAME queue, so the presentation
+    // engine consumes the image only after the render completes.
+    slangvk_chain_render_swapchain_async(s_chain, &in, &out, &fi, &async_fence)
+#else
+    slangvk_chain_render_swapchain(s_chain, &in, &out, &fi)
+#endif
+    ;
     if (rr != SLANGVK_OK) {
         ++s_consec_fail;
         g3x_log("slang: render failed (%s)%s", slangvk_result_name(rr),
@@ -1804,6 +1839,12 @@ bool g3x_slang_present(const uint8_t* bgra, unsigned w, unsigned h, void* upload
     // pending, and the legacy tail in g3x_frame serves it from compose — the
     // unfiltered frame that actually gets presented that frame.
     if (g3x_shot_take_pending()) {
+#ifdef G3XVK_SLANGVK_ASYNC
+        // The shot reads the swapchain image the chain JUST rendered (async):
+        // drain the chain first, then the readback submit sees the finished
+        // PRESENT_SRC image (its own fenced submit follows).
+        slangvk_chain_wait_idle(s_chain);
+#endif
         const uint8_t* px = g3x_vk_slang_readback_acquired(idx);
         if (px) shot_submit_and_report(px, ew, eh);
     }

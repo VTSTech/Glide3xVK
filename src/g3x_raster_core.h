@@ -462,13 +462,27 @@ inline void fill_rect_exec(H& st, float xa, float xb, float ya, float yb) {
 template <class H>
 inline bool blit_quad_exec(H& st, const RVert* v, const TexView& t, float tsx, float tsy,
                            bool strip) {
-    if (!st.px() || !t.data || t.bpp != 1) return false;
+    // Two texture classes take the fast path:
+    //   bpp 1 (P_8)  — the paletted tile/sprite class; palette-index texels,
+    //                  chroma punch, uniform-vc pal_mult LUT.
+    //   bpp 2 (RGB_565) — the 16-bpp class D2 submits for light maps / video
+    //                  quads (fill_span's bpp==2 branch treats EVERY 2-byte
+    //                  texture as RGB_565 — mirrored here exactly): direct
+    //                  color texel expansion, NO chroma, NO vertex-color
+    //                  multiply, so the per-pixel source needs no LUT at all.
+    // Everything else (geometry/slope/boundary proofs below) is texture
+    // format agnostic — the barycentric path's coverage for the accepted
+    // shape is [x0,x1) x [y0,y1) either way.
+    if (!st.px() || !t.data || (t.bpp != 1 && t.bpp != 2)) return false;
     if (st.color_fill()) return false;
+    const bool pal8 = (t.bpp == 1);
 
-    // uniform vertex color (the pal_mult LUT path) — per-pixel vc falls back
-    if (!(v[0].argb == v[1].argb && v[1].argb == v[2].argb &&
-          v[2].argb == v[3].argb)) return false;
-    st.ensure_pal_mult(v[0].argb & 0x00FFFFFFu);
+    // uniform vertex color (the pal_mult LUT path) — per-pixel vc falls back.
+    // RGB_565 texels ignore vertex color entirely (fill_span does), so the
+    // check is only needed on the paletted class.
+    if (pal8 && !(v[0].argb == v[1].argb && v[1].argb == v[2].argb &&
+                  v[2].argb == v[3].argb)) return false;
+    if (pal8) st.ensure_pal_mult(v[0].argb & 0x00FFFFFFu);
 
     // bounds; integer corners; in-frame (clipped quads keep the exact path)
     float minx = v[0].x, maxx = v[0].x, miny = v[0].y, maxy = v[0].y;
@@ -555,9 +569,91 @@ inline bool blit_quad_exec(H& st, const RVert* v, const TexView& t, float tsx, f
     uint32_t* px = st.px();
     const unsigned w = st.width();
 
+    // texel-row stride in BYTES: P8 rows are tw bytes; RGB_565 rows are 2*tw
+    // (fill_span indexes the 565 texel as tdata[2*(ty*tw+tx)], same stride).
+    const size_t tstride = (size_t)tw * (pal8 ? 1u : 2u);
     for (int y = y0; y < y1; ++y, ++ty0) {
-        const uint8_t* trow = tdata + (size_t)(ty0 & (int)thm) * tw;
+        const uint8_t* trow = tdata + (size_t)(ty0 & (int)thm) * tstride;
         uint32_t* row = px + (size_t)y * w;   // row[x], x in [x0,x1) — same as fill_span
+        if (!pal8) {
+            // RGB_565 rows: texel = two bytes LE (fill_span bpp==2 verbatim),
+            // expanded 5/6/5 -> 8 bits by bit replication, no chroma, no vc.
+            unsigned tx = (unsigned)(tx0 & (int)twm);
+            switch (st.blend_class()) {
+                case BC_OPAQUE:
+                    for (int x = x0; x < x1; ++x) {
+                        const uint16_t p5 = (uint16_t)(trow[2 * tx] | (trow[2 * tx + 1] << 8));
+                        const unsigned r5 = (p5 >> 11) & 0x1Fu, g6 = (p5 >> 5) & 0x3Fu, b5 = p5 & 0x1Fu;
+                        row[x] = 0xFF000000u | ((r5 << 3 | r5 >> 2) << 16)
+                               | ((g6 << 2 | g6 >> 4) << 8) | (b5 << 3 | b5 >> 2);
+                        tx = (tx + 1u) & twm;
+                    }
+                    break;
+                case BC_ADD: {
+                    for (int x = x0; x < x1; ++x) {
+                        const uint16_t p5 = (uint16_t)(trow[2 * tx] | (trow[2 * tx + 1] << 8));
+                        const unsigned r5 = (p5 >> 11) & 0x1Fu, g6 = (p5 >> 5) & 0x3Fu, b5 = p5 & 0x1Fu;
+                        const uint32_t src = 0xFF000000u | ((r5 << 3 | r5 >> 2) << 16)
+                                           | ((g6 << 2 | g6 >> 4) << 8) | (b5 << 3 | b5 >> 2);
+                        const uint32_t dst = row[x];
+                        unsigned b = (dst & 0xFFu) + (src & 0xFFu);
+                        unsigned g = ((dst >> 8) & 0xFFu) + ((src >> 8) & 0xFFu);
+                        unsigned r = ((dst >> 16) & 0xFFu) + ((src >> 16) & 0xFFu);
+                        if (b > 255u) b = 255u;
+                        if (g > 255u) g = 255u;
+                        if (r > 255u) r = 255u;
+                        row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                        tx = (tx + 1u) & twm;
+                    }
+                    break;
+                }
+                case BC_LERP: {
+                    const unsigned a = st.const_alpha(), ia = 255u - a;
+                    for (int x = x0; x < x1; ++x) {
+                        const uint16_t p5 = (uint16_t)(trow[2 * tx] | (trow[2 * tx + 1] << 8));
+                        const unsigned r5 = (p5 >> 11) & 0x1Fu, g6 = (p5 >> 5) & 0x3Fu, b5 = p5 & 0x1Fu;
+                        const uint32_t src = 0xFF000000u | ((r5 << 3 | r5 >> 2) << 16)
+                                           | ((g6 << 2 | g6 >> 4) << 8) | (b5 << 3 | b5 >> 2);
+                        const uint32_t dst = row[x];
+                        unsigned b = (((src & 0xFFu) * a + 255u) >> 8) + (((dst & 0xFFu) * ia + 255u) >> 8);
+                        unsigned g = ((((src >> 8) & 0xFFu) * a + 255u) >> 8) + ((((dst >> 8) & 0xFFu) * ia + 255u) >> 8);
+                        unsigned r = ((((src >> 16) & 0xFFu) * a + 255u) >> 8) + ((((dst >> 16) & 0xFFu) * ia + 255u) >> 8);
+                        if (b > 255u) b = 255u;
+                        if (g > 255u) g = 255u;
+                        if (r > 255u) r = 255u;
+                        row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                        tx = (tx + 1u) & twm;
+                    }
+                    break;
+                }
+                case BC_MUL: {
+                    for (int x = x0; x < x1; ++x) {
+                        const uint16_t p5 = (uint16_t)(trow[2 * tx] | (trow[2 * tx + 1] << 8));
+                        const unsigned r5 = (p5 >> 11) & 0x1Fu, g6 = (p5 >> 5) & 0x3Fu, b5 = p5 & 0x1Fu;
+                        const uint32_t src = 0xFF000000u | ((r5 << 3 | r5 >> 2) << 16)
+                                           | ((g6 << 2 | g6 >> 4) << 8) | (b5 << 3 | b5 >> 2);
+                        const uint32_t dst = row[x];
+                        unsigned b = ((dst & 0xFFu) * (src & 0xFFu) + 255u) >> 8;
+                        unsigned g = (((dst >> 8) & 0xFFu) * ((src >> 8) & 0xFFu) + 255u) >> 8;
+                        unsigned r = (((dst >> 16) & 0xFFu) * ((src >> 16) & 0xFFu) + 255u) >> 8;
+                        row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                        tx = (tx + 1u) & twm;
+                    }
+                    break;
+                }
+                default:             // BC_GEN: the exact per-pixel generic blend
+                    for (int x = x0; x < x1; ++x) {
+                        const uint16_t p5 = (uint16_t)(trow[2 * tx] | (trow[2 * tx + 1] << 8));
+                        const unsigned r5 = (p5 >> 11) & 0x1Fu, g6 = (p5 >> 5) & 0x3Fu, b5 = p5 & 0x1Fu;
+                        const uint32_t src = 0xFF000000u | ((r5 << 3 | r5 >> 2) << 16)
+                                           | ((g6 << 2 | g6 >> 4) << 8) | (b5 << 3 | b5 >> 2);
+                        row[x] = blend_px(st, row[x], src);
+                        tx = (tx + 1u) & twm;
+                    }
+                    break;
+            }
+            continue;
+        }
         unsigned tx = (unsigned)(tx0 & (int)twm);
         switch (st.blend_class()) {
             case BC_OPAQUE:      // blend_px: src | 0xFF000000

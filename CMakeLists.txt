@@ -89,6 +89,24 @@ if(EXISTS "${G3XVK_SLANGVK_DIR}/CMakeLists.txt")
     target_link_libraries(glide3x PRIVATE slangvk::slangvk)
     target_compile_definitions(glide3x PRIVATE G3XVK_HAVE_SLANGVK=1)
     message(STATUS "glide3xvk: libslang-vk at ${G3XVK_SLANGVK_DIR} — preset chain linked (P3)")
+    # Async chain render (CPU-route perf round 3): the C API gained
+    # slangvk_chain_render_swapchain_async / slangvk_chain_wait_idle, which
+    # submit the chain WITHOUT fence-waiting it — the preset's GPU passes
+    # overlap the game's next-frame CPU loop instead of blocking inside
+    # grBufferSwap (the field log pins the sync wait at ~23 ms/frame with a
+    # 5-pass 1080p preset). Detect the API in the linked checkout's header so
+    # a pinned older checkout still builds (sync render, current behavior) —
+    # flip the checkout and rebuild to get the async path.
+    file(READ "${G3XVK_SLANGVK_DIR}/include/slangvk/c.h" _g3x_slangvk_c)
+    string(FIND "${_g3x_slangvk_c}" "slangvk_chain_render_swapchain_async" _g3x_async_pos)
+    if(NOT _g3x_async_pos EQUAL -1)
+        target_compile_definitions(glide3x PRIVATE G3XVK_SLANGVK_ASYNC=1)
+        message(STATUS "glide3xvk: libslang-vk has the async chain render — "
+                       "preset GPU work overlaps the game frame (G3XVK_SLANGVK_ASYNC)")
+    else()
+        message(STATUS "glide3xvk: libslang-vk lacks the async chain render — "
+                       "synchronous chain render stays (update the libslang-vk checkout)")
+    endif()
 else()
     target_compile_definitions(glide3x PRIVATE G3XVK_HAVE_SLANGVK=0)
     message(STATUS "glide3xvk: libslang-vk NOT FOUND at ${G3XVK_SLANGVK_DIR} — "

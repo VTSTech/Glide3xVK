@@ -7,6 +7,65 @@ Format follows Keep a Changelog. Where a field round already ran, entries cite w
 glide3x.log showed on real hardware (RX 560, Vulkan 1.3, windowed). Commit refs are on
 branch `libslang-vk` of VTSTech/D2LoD-libslang-vk.
 
+## [Unreleased] — CPU-route perf round 3 (async chain render + RGB565 blit)
+
+### Changed
+
+- **Preset chain renders ASYNC — the ~23 ms/frame host block is gone** (g3x_slang.cpp +
+  libslang-vk C API): the 0.4.8 field log pinned the slang chain cost precisely —
+  `work=25.8ms avg=67.6ms` (14.8 FPS) with `smaa+linear` live vs `work=2.8ms avg≈41ms`
+  with the preset off, because `slangvk_chain_render_swapchain` is a synchronous
+  record→submit→**fence-wait** (`Chain::render` = `render_async` + `wait_async`): the
+  game thread sat inside `grBufferSwap` until every one of the chain's 5 passes
+  finished on the GPU. The libslang-vk C API now exposes
+  `slangvk_chain_render_swapchain_async` (submit + return the chain-owned fence, no
+  wait) and `slangvk_chain_wait_idle` (drain all in-flight chain frames — `Chain::wait_idle()`
+  added next to `wait_async`); `g3x_slang_present` submits and returns, and the preset's
+  GPU passes overlap the game's next-frame CPU loop instead of serializing inside the
+  swap. Safety model (framesInFlight=1, unchanged): the NEXT async render's slot wait
+  retires the previous chain frame — never more than one chain submission in flight, so
+  the input image and pass targets need no extra sync; the same-queue present consumes
+  the swapchain image only after the render completes (queue order, unchanged from the
+  sync path). The steady-state cost added to `work=` is the record + submit (~1 ms);
+  the wait is backpressure only when the GPU actually falls behind. Guards: any
+  non-steady feed (classic `slangvk_image_update`, base_res>1 blit, input-image
+  recreate) drains the chain first via `wait_idle`; the PrintScreen readback waits it
+  too (the shot reads the swapchain image the async render just wrote). The input
+  staging is now a **2-slot rotating ring** (vk_backend `g3x_vk_slang_input_stage`) —
+  the async chain reads slot A while the game thread composes frame N+1 into slot B.
+  Fail-soft: CMake probes `include/slangvk/c.h` for the async symbols and defines
+  `G3XVK_SLANGVK_ASYNC` only when present — an older pinned checkout builds exactly
+  as before (sync render); no other behavior changes either way. Expected field shape
+  (from the 0.4.8 log arithmetic): with a 5-pass 1080p preset, `work=` 25.8 → ~2-3 ms,
+  `avg` 67.6 → ~40-43 ms (≈25 FPS band, same as the unfiltered path + compose).
+
+- **RGB565 quads take the blit fast path** (g3x_raster_core.h `blit_quad_exec`): the
+  tile-class blit was P8-only (`t.bpp != 1` bailed), so every 16-bpp draw — the
+  light-map/video class, 300-1500+ draws/frame in the 0.4.8 field windows — ran the
+  barycentric scanline path with per-pixel float edge/attribute machinery. The fast
+  path now accepts bpp==2 with the texel expansion mirrored verbatim from `fill_span`'s
+  bpp==2 branch (5/6/5 bit replication, no chroma — it is P8-only there, no
+  vertex-color multiply — `fill_span` ignores vc for 2-bpp textures, same lane math
+  per blend class). Geometry/slope/boundary proofs are unchanged (format-agnostic).
+  Verified two ways: the 16-frame corpus pin stays byte-identical
+  (`spike/raster_hashes_stage1.txt`), and a new differential fuzzer
+  (`scripts/fastpath_fuzz.cpp`) ran **29,498 fast-vs-exact quad cases with 0
+  mismatches** (≈14.6k P8 + ≈14.8k RGB565, all five blend classes, fan + strip,
+  chroma on/off, per-corner-varying vc on the 565 class). The fuzzer caught and
+  fixed one real bug pre-release: the texel-row stride must be `2*tw` bytes on the
+  565 class (the P8 `tw` stride shifted every row from the second one on). Menu
+  corpora cannot exercise this path (`565hits=0` probe) — gameplay windows are where
+  it pays.
+
+### libslang-vk (same round, VTSTech/libslang-vk)
+
+- C API: `slangvk_chain_render_swapchain_async` + `slangvk_chain_wait_idle`
+  (src/c_api.cpp, include/slangvk/c.h); C++ API: `Chain::wait_idle()`
+  (include/slangvk/runner.hpp, src/vk/chain.cpp). No behavior change to any existing
+  entry point; `Chain::render` stays synchronous. CI pins glide3xvk's libslang-vk
+  checkout — bump the pin to pick the async path (the wrapper's CMake probe falls
+  back to the sync render until then, by design).
+
 ## [0.4.7] - 2026-11-05
 
 ### Added

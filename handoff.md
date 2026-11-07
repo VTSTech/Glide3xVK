@@ -6,6 +6,83 @@ Date: 2026-10-30. Repo: `github.com/VTSTech/D2LoD-libslang-vk` (Glide3xVK line),
 
 ---
 
+## 0. CPU-route perf round 3 (2026-11-07) — async chain render + RGB565 blit — LANDED LOCALLY, awaits user build + field round
+
+User directive: **CPU route first, GPU route (Route B) deferred** until the CPU route holds
+25 FPS at 1080p. The 0.4.8 field log (1920x1080, RX 560, `smaa+linear` 5 passes) decoded:
+
+| State | avg= (swap-to-swap wall) | work= (inside grBufferSwap) | FPS |
+|---|---|---|---|
+| preset ON (`smaa+linear`) | 67.6 ms | 25.8 ms | 14.8 |
+| preset OFF (`slang-off`) | 40.5–42.7 ms | 2.6–3.7 ms | ~23.5–24.7 |
+
+Root causes found (source-verified, not guessed):
+
+1. **`slangvk_chain_render_swapchain` is fully synchronous** — the C API wraps
+   `Chain::render` = `render_async` + `wait_async`: record → submit → **fence-wait**. The
+   game thread blocked inside `grBufferSwap` until all 5 chain passes finished on the GPU
+   (~23 ms at 1080p). The library ALREADY had `render_async` (submit, return fence) — just
+   not exposed over the C API.
+2. **`blit_quad_exec` was P8-only** (`t.bpp != 1` bail): every RGB565 draw (light-map/video
+   class — the `rgb565=` counter ran 300–1500+/frame in the field windows) took the
+   barycentric scanline path.
+
+Fixes landed (working tree, on top of the user's unpushed 0.4.8 WIP):
+
+- **libslang-vk**: `Chain::wait_idle()` (runner.hpp + chain.cpp), C API
+  `slangvk_chain_render_swapchain_async` + `slangvk_chain_wait_idle` (c_api.cpp + c.h).
+  Sync entry points untouched. Host contract: with framesInFlight=1 there is never more
+  than one chain submission in flight; the next render (or wait_idle) retires it; hosts
+  must double-buffer any host-owned pixelBuffer and drain before touching chain
+  images (documented in c.h).
+- **g3x_slang.cpp**: async render behind `G3XVK_SLANGVK_ASYNC` (CMake probes c.h for the
+  symbol — older pinned checkout = sync render, byte-for-byte today's behavior);
+  `wait_idle` guards on every non-steady feed (classic image_update, base_res>1 blit,
+  input-image recreate) and before the PrintScreen readback.
+- **vk_backend.cpp**: slang input staging is a 2-slot rotating ring
+  (`g3x_vk_slang_input_stage`) — async chain reads slot A while the game thread composes
+  frame N+1 into slot B. Cleanup paths loop the ring.
+- **g3x_raster_core.h**: `blit_quad_exec` accepts bpp==2 (RGB565) with the texel
+  expansion + blend math mirrored verbatim from `fill_span`'s bpp==2 branch.
+
+Verification run in-sandbox (all green):
+
+- Corpus pin: `raster_regress cpu` → 16/16 hashes byte-identical to
+  `spike/raster_hashes_stage1.txt` (before AND after the raster change).
+- New differential fuzzer `scripts/fastpath_fuzz.cpp` (fast path vs `raster_tri` on
+  identical quads): **29,498 cases, 0 mismatches** (P8+RGB565, 5 blend classes, fan+strip,
+  chroma on/off, varying vc on 565). It caught one real bug pre-release: the 565 texel-row
+  stride is `2*tw` bytes, not the P8 `tw` (every row from the second on was shifted).
+  Note: the menu corpus never exercises the 565 fast path (`565hits=0` probe build) — the
+  fuzzer is the 565 coverage.
+- libslang-vk full host build (cmake+ninja, 121 targets incl. test_c_api/test_runner_async):
+  clean; tests SKIP without a Vulkan ICD (no lavapipe in this sandbox — CI covers them).
+- Wrapper TUs (g3x_slang / vk_backend / g3x_frame) syntax-clean against the real slangvk
+  headers in BOTH `G3XVK_SLANGVK_ASYNC=1` and `=0` modes (fakewin shim + shims in /tmp —
+  the shim itself was NOT committed).
+
+Expected field shape (log arithmetic, to be confirmed by the next round): preset ON
+`work=` 25.8 → **~2–3 ms**, `avg` 67.6 → **~40–43 ms**; the unfiltered path stays ~41 ms;
+the RGB565 blit shaves the light-map class's per-pixel float work out of the game's
+37–40 ms CPU budget.
+
+Next actions (user):
+
+1. Commit + push the libslang-vk changes (c_api.cpp, c.h, runner.hpp, chain.cpp); bump the
+   glide3xvk CI pin to that commit so CI links the async API.
+2. Rebuild the DLL per BUILD-32BIT.md (`d2w-` toolchain). The configure log must show
+   `glide3xvk: libslang-vk has the async chain render — preset GPU work overlaps the game
+   frame (G3XVK_SLANGVK_ASYNC)`.
+3. Field round at 1080p: preset ON, read `frame NNNN:` lines. PASS = `work=` ≤ ~3.5 ms with
+   the preset live and `avg` in the 40–43 band. If `avg` still overshoots 43 ms, the next
+   CPU-route levers are (in cost order): the compose memcpy into the staging ring
+   (~0.5–0.7 ms — raster-into-staging), then the non-uniform-vc P8 quad class (the ~95% of
+   vac fans the uniform-vc fast path rejects — ground tiles with per-corner light tints;
+   needs a bit-exact fixed-point vc ramp, harder).
+4. `raster=gpu` / Route B stays parked per the user's ordering until the CPU route holds 25.
+
+---
+
 ## 1. Status snapshot
 
 | Stage | Scope | State |
