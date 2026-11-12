@@ -27,6 +27,9 @@ frame runs through the slang preset at up-scaled resolution; the full-screen
 side (SSE2 float math, O(1) texture table, swapchain headroom — verified
 bit-identical by the agent-side parity harness); field numbers pending.
 
+**Note**: As of 0.4.8, Glide3xVK uses a CPU-based rasterizer only. The GPU rasterizer
+(Route B) has been removed for stability. See `docs/CURRENT-STATUS.md` for details.
+
 ```
 d2.exe ── LoadLibraryA("glide3x.dll") ──► glide3x.dll (this directory)
               45 Glide exports                │
@@ -498,11 +501,7 @@ The DirectDraw path (`-w`) is untouched by all of this.
 
 ## What is deliberately NOT here yet
 
-- GPU-side raster (the 60 fps endgame): the 0.4.3 full-screen log measured
-  51.6 ms ≈ 19 fps @ 800x600 with the chain active; 0.4.5 took the first CPU
-  side cut (see Performance above), and the compose-to-GPU move remains the
-  main remaining perf item — present-path fence pipelining and span-raster
-  templating are queued as CPU-side round 2 (PLAN.md §5 perf track).
+
 - Bilinear texture filtering (look delta only): the ground requests
   `texFilterMode(1,1)` and is point-sampled today.
 - Preset parameter UI / per-preset geometry defaults (P4): parameters are
