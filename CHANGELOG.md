@@ -7,57 +7,6 @@ Format follows Keep a Changelog. Where a field round already ran, entries cite w
 glide3x.log showed on real hardware (RX 560, Vulkan 1.3, windowed). Commit refs are on
 branch `libslang-vk` of VTSTech/D2LoD-libslang-vk.
 
-## [0.4.10] - 2026-11-13 (P20: the iso-lattice triangle exec + the f2 light-map route)
-
-### Added
-
-- **The iso-lattice triangle exec (`g3x_blit_iso.h`, P20)** — a per-triangle
-  fast path for the isometric lattice family the 0.4.7-21 field session
-  pinned via the P18 diagnostics: integer vertices, two slanted edges with
-  |dx| == 2*|dy| (slope ±2 px/row), one axis-aligned edge. Every edge
-  crossing lands on an exact integer at every pixel row and no pixel center
-  (k+0.5) can lie on any edge, so the exec computes each row's span in
-  closed-form integers where the exact path runs edge intersections plus up
-  to 12 boundary fixups (`inside_exact` calls) per row — while the attribute
-  arithmetic stays bit-identical by construction (the same wa/wb/wc
-  expression text feeds u0/v0, and u/v accumulate through fill_span's
-  verbatim float walk, so no slope or frac-margin proofs are needed). Wired
-  first-try per triangle in the pointer-array strip/fan loops and the
-  contiguous fan loop; anything outside the family falls back to
-  `raster_tri` unchanged. `scripts/fastpath_fuzz.cpp` gains the iso
-  differential: 45,308 accepted cases byte-equal to the exact path (both
-  orientations, all 6 vertex permutations, clipped/off-frame positions,
-  all 5 blend classes, P8 + RGB565, chroma on/off), 6,250 adversarial cases
-  (non-integer coords, broken slopes, off-center apex, P8 varying vc) all
-  rejected, 0 mismatches. Periodic line grows `isot=` (slot 12).
-
-### Fixed
-
-- **The D2VP f2 batched light map renders again (P19)** — reading the game
-  source (VTSTech/D2VP-QoL, `RENDERER_GLIDE_DrawLightMap`, glide-perf f2)
-  showed the radial-light layer submits ONE contiguous
-  `grDrawVertexArrayContiguous(GR_POINTS=0, 18432, ...)` array per frame;
-  the wrapper counted and logged contiguous non-fan modes but never
-  rasterized them, so the whole layer had been silently missing (the fork's
-  own A/B gate anticipated exactly this failure). New
-  `g3x_frame_draw_points_array`: one rounded pixel per vertex, the vertex's
-  own dwColor (iterated color) through the current blend pair — same
-  semantics as `grDrawPoint`, per-vertex. The periodic line grows `ptsarr=`
-  (slot 11); the field log's ~60/f are the per-light dot arrays, an
-  18,432/f reading means the full light-map grid is flowing.
-
-### Diagnostics
-
-- **P18 field dumps** — the first two rejected strips in full and the first
-  eight rejected 4-vertex fans (`striprej#`/`fanrej#`), which pinned the
-  lattice geometry this round's exec targets.
-- **Texture-cache probe (txb=)** — `grTexDownloadMipMap` now accumulates
-  downloaded bytes (`txb=` in the periodic line) and logs the first 40
-  downloads with (tmu, addr, fmt, lods, bytes): the 0.4.7-21 session's
-  steady texdl=63-73/f gets a thrash-vs-normal verdict from the address
-  bands (the fork's `RENDERER_GLIDE_InitTextureMemory` partitioning maps
-  addresses 1:1 onto floor/subtile/sprite caches).
-
 ## [0.4.8] - 2026-11-12 (Route B retired — the CPU raster is the route)
 
 ### Removed
@@ -127,7 +76,26 @@ branch `libslang-vk` of VTSTech/D2LoD-libslang-vk.
   `.cmd`, d9d9df8): a full clean-build script (toolchain check, volk/
   slang-vk fetch, 32-bit MSVC/Clang cross, DLL + fuzzer + scalecopy test)
   so a field build no longer depends on the CI runner.
-
+- **The iso-lattice triangle exec (`g3x_blit_iso.h`, P20)** — a per-triangle
+  fast path for the isometric lattice family the 0.4.7-21 field session
+  pinned via the P18 diagnostics: integer vertices, two slanted edges with
+  |dx| == 2*|dy| (slope ±2 px/row), one axis-aligned edge. Every edge
+  crossing lands on an exact integer at every pixel row and no pixel center
+  (k+0.5) can lie on any edge, so the exec computes each row's span in
+  closed-form integers where the exact path runs edge intersections plus up
+  to 12 boundary fixups (`inside_exact` calls) per row — while the attribute
+  arithmetic stays bit-identical by construction (the same wa/wb/wc
+  expression text feeds u0/v0, and u/v accumulate through fill_span's
+  verbatim float walk, so no slope or frac-margin proofs are needed). Wired
+  first-try per triangle in the pointer-array strip/fan loops and the
+  contiguous fan loop; anything outside the family falls back to
+  `raster_tri` unchanged. `scripts/fastpath_fuzz.cpp` gains the iso
+  differential: 45,308 accepted cases byte-equal to the exact path (both
+  orientations, all 6 vertex permutations, clipped/off-frame positions,
+  all 5 blend classes, P8 + RGB565, chroma on/off), 6,250 adversarial cases
+  (non-integer coords, broken slopes, off-center apex, P8 varying vc) all
+  rejected, 0 mismatches. Periodic line grows `isot=` (slot 12).
+  
 ### Changed
 
 - **P15 compiler flags** (CMakeLists.txt, 8294bd7): `-O3` for the wrapper
@@ -149,6 +117,33 @@ branch `libslang-vk` of VTSTech/D2LoD-libslang-vk.
   `fastpath_fuzz` + `scalecopy_test`, and the `-Wl,-u` archive-member
   forcing the def-file symbol lookup needs for the P13 exec's TU.
 
+### Fixed
+
+- **The D2VP f2 batched light map renders again (P19)** — reading the game
+  source (VTSTech/D2VP-QoL, `RENDERER_GLIDE_DrawLightMap`, glide-perf f2)
+  showed the radial-light layer submits ONE contiguous
+  `grDrawVertexArrayContiguous(GR_POINTS=0, 18432, ...)` array per frame;
+  the wrapper counted and logged contiguous non-fan modes but never
+  rasterized them, so the whole layer had been silently missing (the fork's
+  own A/B gate anticipated exactly this failure). New
+  `g3x_frame_draw_points_array`: one rounded pixel per vertex, the vertex's
+  own dwColor (iterated color) through the current blend pair — same
+  semantics as `grDrawPoint`, per-vertex. The periodic line grows `ptsarr=`
+  (slot 11); the field log's ~60/f are the per-light dot arrays, an
+  18,432/f reading means the full light-map grid is flowing.
+
+### Diagnostics
+
+- **P18 field dumps** — the first two rejected strips in full and the first
+  eight rejected 4-vertex fans (`striprej#`/`fanrej#`), which pinned the
+  lattice geometry this round's exec targets.
+- **Texture-cache probe (txb=)** — `grTexDownloadMipMap` now accumulates
+  downloaded bytes (`txb=` in the periodic line) and logs the first 40
+  downloads with (tmu, addr, fmt, lods, bytes): the 0.4.7-21 session's
+  steady texdl=63-73/f gets a thrash-vs-normal verdict from the address
+  bands (the fork's `RENDERER_GLIDE_InitTextureMemory` partitioning maps
+  addresses 1:1 onto floor/subtile/sprite caches).
+  
 ### Validated
 
 - Field rounds (2026-11-12, RX Vega 11 rig, windowed 1080p desktop /
