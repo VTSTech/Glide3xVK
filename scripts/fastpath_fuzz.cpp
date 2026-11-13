@@ -293,6 +293,10 @@ static void ref_raster_tri(H& h, const RVertRef& A0, const RVertRef& B0, const R
 
 static uint64_t rng_s = 0x9e3779b97f4a7c15ull;
 static int x0c = 0, y0c = 0;
+// strip-case derivation (set by make_case on success, read by make_strip_case)
+static unsigned qhc = 0;
+static float vy0c = 0.0f, vspanc = 256.0f;
+static uint32_t vccc = 0xFF000000u;
 static inline uint32_t rnd() {
     rng_s ^= rng_s << 13; rng_s ^= rng_s >> 7; rng_s ^= rng_s << 17;
     return (uint32_t)(rng_s >> 32);
@@ -370,6 +374,7 @@ static void make_case(FuzzHost& h, g3xbq::Vert v[4], bool& strip, unsigned iter)
     const int x1 = x0 + (int)qs;
     const int y1 = y0 + (int)qh;
     const uint32_t vcc = h.tbpp == 1 ? (vc | 0xFF000000u) : (uint32_t)rnd();
+    qhc = qh; vy0c = vy0; vspanc = vspan; vccc = vcc;   // strip-case derivation
     const bool flip = rndn(2) == 0;
     unsigned vi[4][2];
     if (flip) { vi[0][0]=1;vi[0][1]=1; vi[1][0]=0;vi[1][1]=1; vi[2][0]=1;vi[2][1]=0; vi[3][0]=0;vi[3][1]=0; }
@@ -382,6 +387,121 @@ static void make_case(FuzzHost& h, g3xbq::Vert v[4], bool& strip, unsigned iter)
     }
     if (h.tbpp == 2) v[1].argb = rnd();   // per-corner vc: 565 must ignore it
     strip = rndn(2) == 0;
+}
+
+// ---- P17 strip-decomposition round ------------------------------------------
+// The dispatcher decomposes a G3X_GR_TRIANGLE_STRIP draw into 4-vertex windows
+// (verts 2k..2k+3 = strip triangles #2k, #2k+1 — the even-offset pairs tile
+// the tri list exactly), proving every window dry (blit_quad_prove) before
+// painting any (blit_quad_exec). The reference is the dispatcher's exact path:
+// every strip triangle winding-normalized through ref_raster_tri. Accepted
+// strips must match byte-for-byte; adversarial windows (fractional corner,
+// torn rect) must REJECT — an accepted corrupt window shows up as a mismatch.
+static unsigned s_strip_adv = 0;
+static bool make_strip_case(FuzzHost& h, std::vector<g3xbq::Vert>& sv, unsigned iter) {
+    g3xbq::Vert q[4]; bool s;
+    make_case(h, q, s, iter);                 // host/texture/blend state + families
+    if (q[0].x < 0) return false;
+    const int x0 = x0c, y0 = y0c;
+    const unsigned qs2 = 1u << h.tlod;
+    const unsigned N = 2 + rndn(4);           // 2..5 rects
+    const bool odd = rndn(4) == 0;            // odd tri count: trailing half-tile tri
+    const unsigned P = N + 1u + (odd ? 1u : 0u);   // column pairs (odd: + tip vert)
+    if (x0 + (int)(P * qs2) + 2 > (int)h.W ||
+        y0 + (int)qhc + 2 > (int)h.H) return false;
+    s_strip_adv = 0;
+    sv.clear();
+    sv.reserve((size_t)2 * P + 1);
+    for (unsigned m = 0; m < P; ++m) {        // zigzag top/bottom columns: T_m,B_m
+        const float x = (float)(x0 + (int)(m * qs2));
+        const float u = (float)(m * 256u);
+        sv.push_back({ x, (float)y0, u, vy0c, vccc });
+        sv.push_back({ x, (float)(y0 + (int)qhc), u, vy0c + vspanc, vccc });
+    }
+    if (odd)
+        sv.push_back({ (float)(x0 + (int)(P * qs2)), (float)y0,
+                       (float)(P * 256u), vy0c, vccc });
+    if (rndn(6) == 0) {                       // adversarial: corrupt a shared vertex
+        s_strip_adv = 1;
+        const unsigned i = 2u + rndn((unsigned)sv.size() - 2u);
+        switch (rndn(3)) {
+            case 0:  sv[i].x += 0.5f; break;  // fractional corner
+            case 1:  sv[i].y = (i & 1u) ? (float)y0 + (float)qhc - 1.0f   // torn rect
+                                        : (float)y0 + 1.0f;
+                     break;
+            default: sv[i].argb ^= 0x00FF00FFu; break;  // vc break (P8 rejects;
+                     // 565 ignores vc, so this one stays accepted AND neutral)
+        }
+    }
+    return true;
+}
+
+static int strip_round(unsigned iters) {
+    FuzzHost h;
+    std::vector<g3xbq::Vert> sv;
+    unsigned ran = 0, mism = 0, acc = 0, odd_n = 0, adv_n = 0;
+    for (unsigned it = 0; it < iters; ++it) {
+        if (!make_strip_case(h, sv, 7919u * iters + it)) continue;
+        const unsigned count = (unsigned)sv.size();
+        const float tsx = (float)(1u << h.tlod) / 256.0f, tsy = tsx;
+        const g3xbq::TexView tv{ h.tbpp == 1 ? h.tex8.data() : h.tex16.data(),
+                                 h.tw, h.th, h.tlod, h.tbpp };
+        const bool oddc = (count & 1u) != 0;
+        const bool advc = s_strip_adv != 0;
+
+        std::vector<uint32_t> fast = h.buf, slow = h.buf;
+        bool accepted = true;
+        {   // fast side — verbatim mirror of strip_blit_fast
+            struct FastHost : FuzzHost { uint32_t* fpx; uint32_t* px() { return fpx; } } h2;
+            *static_cast<FuzzHost*>(&h2) = h;
+            h2.fpx = fast.data();
+            for (unsigned k = 0; k + 3 < count; k += 2)
+                if (!g3xbq::blit_quad_prove(h2, &sv[k], tv, tsx, tsy, true)) { accepted = false; break; }
+            if (accepted) {
+                for (unsigned k = 0; k + 3 < count; k += 2)
+                    if (!g3xbq::blit_quad_exec(h2, &sv[k], tv, tsx, tsy, true)) { accepted = false; break; }
+                if (accepted && ((count - 2) & 1u)) {
+                    const g3xbq::Vert& a = sv[count - 3];
+                    RVertRef A{a.x, a.y, a.u, a.v, a.argb}, B, C;
+                    const g3xbq::Vert& b = sv[count - 2];
+                    const g3xbq::Vert& c = sv[count - 1];
+                    B = {b.x, b.y, b.u, b.v, b.argb};
+                    C = {c.x, c.y, c.u, c.v, c.argb};
+                    const float area = (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
+                    if (area < 0.0f) { RVertRef t = B; B = C; C = t; }
+                    ref_raster_tri(h2, A, B, C, tsx, tsy);
+                }
+            }
+        }
+        if (!accepted) continue;              // dispatcher falls back — nothing to compare
+        {   // reference: every strip triangle, winding-normalized, exact path
+            struct SlowHost : FuzzHost { uint32_t* spx; uint32_t* px() { return spx; } } h3;
+            *static_cast<FuzzHost*>(&h3) = h;
+            h3.spx = slow.data();
+            for (unsigned i = 0; i + 2 < count; ++i) {
+                RVertRef A{sv[i].x, sv[i].y, sv[i].u, sv[i].v, sv[i].argb};
+                RVertRef B{sv[i+1].x, sv[i+1].y, sv[i+1].u, sv[i+1].v, sv[i+1].argb};
+                RVertRef C{sv[i+2].x, sv[i+2].y, sv[i+2].u, sv[i+2].v, sv[i+2].argb};
+                const float area = (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
+                if (area < 0.0f) { RVertRef t = B; B = C; C = t; }
+                ref_raster_tri(h3, A, B, C, tsx, tsy);
+            }
+        }
+        ++ran; ++acc;
+        if (oddc) ++odd_n;
+        if (advc) ++adv_n;
+        if (fast != slow) {
+            ++mism;
+            if (mism <= 2)
+                std::printf("STRIP MISMATCH iter=%u bpp=%u count=%u odd=%u adv=%u sf=%u W=%u H=%u lod=%u\n",
+                            it, h.tbpp, count, (unsigned)oddc, (unsigned)advc,
+                            h.sf, h.W, h.H, h.tlod);
+            if (mism >= 2) break;
+        }
+    }
+    std::printf("strip round: ran=%u accepted=%u odd=%u adversarial=%u mismatches=%u\n",
+                ran, acc, odd_n, adv_n, mism);
+    return mism ? 1 : 0;
 }
 
 int main(int argc, char** argv) {
@@ -482,5 +602,6 @@ int main(int argc, char** argv) {
                 by_class[0], by_class[1], by_class[2], by_class[3], by_class[4]);
     std::printf("lods: 0=%u 1=%u 2=%u 3=%u 4=%u 5=%u 6=%u 7=%u 8=%u\n",
                 lods[0], lods[1], lods[2], lods[3], lods[4], lods[5], lods[6], lods[7], lods[8]);
-    return mism ? 1 : 0;
+    const int strip_rc = strip_round(iters / 2);   // P17 strip-decomposition round
+    return (mism ? 1 : 0) | strip_rc;
 }

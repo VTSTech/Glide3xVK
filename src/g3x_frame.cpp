@@ -675,6 +675,41 @@ static bool quad_blit_fast(unsigned count, const RVert* v, float tsx, float tsy,
     return false;
 }
 
+// P17 perf (0.4.9): multi-quad triangle strips. The field submits ground/wall
+// rows as G3X_GR_TRIANGLE_STRIP vertex arrays (parr#4: mode=4 count=40) —
+// quad_blit_fast's count==4 gate rejected the whole class (~128 draws/f in
+// the 0.4.8 field log). A zigzag tile strip decomposes into 4-vertex windows
+// (verts 2k..2k+3 = strip triangles #2k and #2k+1 — the even-offset pairs
+// tile the tri list exactly, no triangle painted twice, an odd trailing tri
+// rides raster_tri after the windows). Each window is the same axis-aligned
+// rect the exec already proves, its shared edge (v1,v2) a diagonal or
+// anti-diagonal of the window rect — both pass the exec's corner-bit test.
+// Every window is PROVEN first (blit_quad_prove writes nothing) and only
+// then painted: a mid-strip rejection must fall the WHOLE draw back to the
+// exact path, and a half-blitted strip cannot be un-drawn (blends are not
+// idempotent). s_n_blit counts windows (the paint-level unit the exec owns).
+static bool strip_blit_fast(unsigned count, const RVert* v, float tsx, float tsy) {
+    if (count < 4 || s_cur < 0) return false;
+    const Tex& t = s_tex[s_cur];
+    FrameHost& h = blit_host();
+    const g3xbq::TexView tv{ t.data, t.w, t.h, t.lod, t.bpp };
+    for (unsigned k = 0; k + 3 < count; k += 2)
+        if (!g3xbq::blit_quad_prove(h, (const g3xbq::Vert*)(v + k), tv, tsx, tsy, true))
+            return false;
+    for (unsigned k = 0; k + 3 < count; k += 2)
+        if (!g3xbq::blit_quad_exec(h, (const g3xbq::Vert*)(v + k), tv, tsx, tsy, true))
+            return false;   // unreachable (proved above) — never half-paint
+    if ((count - 2) & 1u) { // odd tri count: the trailing tri has no window
+        const RVert& a = v[count - 3];
+        const RVert& b = v[count - 2];
+        const RVert& c = v[count - 1];
+        const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        if (area >= 0.0f) raster_tri(a, b, c, tsx, tsy);
+        else              raster_tri(a, c, b, tsx, tsy);
+    }
+    return true;
+}
+
 // Field diagnostic (round 10): the first quads per distinct (dims) class,
 // with raw vertices + the applied square-space scale — verifies the P2.7
 // sampling rule directly in the field log without flooding. P2.8: the line
@@ -1062,8 +1097,10 @@ void g3x_frame_draw_pointers(unsigned mode, unsigned count, void* const* pointer
                 verts[0].argb, verts[1].argb, verts[2].argb, verts[3].argb);
         ++s_pdumped;
     }
-    if ((mode == G3X_GR_TRIANGLE_FAN || mode == G3X_GR_TRIANGLE_STRIP) &&
-        quad_blit_fast(count, verts, tsx, tsy, mode == G3X_GR_TRIANGLE_STRIP)) return;
+    if (mode == G3X_GR_TRIANGLE_FAN &&
+        quad_blit_fast(count, verts, tsx, tsy, false)) return;   // P13: 4-vert quads
+    if (mode == G3X_GR_TRIANGLE_STRIP &&
+        strip_blit_fast(count, verts, tsx, tsy)) return;         // P17: tile strips
     if (mode == G3X_GR_TRIANGLE_FAN) {
         ++s_n_parr_fan;
         for (unsigned i = 1; i + 1 < count; ++i) {

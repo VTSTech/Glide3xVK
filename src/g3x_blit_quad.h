@@ -42,6 +42,22 @@
 // sy >= 1). u stays strict 1:1 so the inner loop remains a pure integer
 // walk.
 //
+// P17 (0.4.9): multi-quad triangle strips. The field submits ground/wall rows
+// as G3X_GR_TRIANGLE_STRIP vertex arrays (parr#4: mode=4 count=40) — the
+// count==4 gate rejected the whole class (~128 draws/f in the 0.4.8 log). A
+// zigzag tile strip decomposes into 4-vertex windows (verts 2k..2k+3 = strip
+// triangles #2k and #2k+1 — the even-offset pairs tile the tri list exactly,
+// no triangle drawn twice). Each window is the same axis-aligned rect the
+// exec already proves, and the window's shared edge (v1,v2) is a diagonal OR
+// anti-diagonal of the window rect — both have both corner bits differing, so
+// the existing shared-edge test accepts exactly the covering orders. The
+// stage function now takes a Paint flag: blit_quad_prove() runs every proof
+// with no pixel writes (dry), blit_quad_exec() paints. The strip dispatcher
+// proves ALL windows first — a mid-strip rejection must fall the WHOLE draw
+// back to the exact path, and a half-blitted strip cannot be un-drawn
+// (blends are not idempotent). An odd trailing triangle (odd tri count) rides
+// the exact path after the windows.
+//
 // `strip` selects the triangulation the dispatcher will run (fan:
 // (0,1,2)+(0,2,3), strip: (0,1,2)+(1,2,3) with per-tri winding normalize).
 // The two triangles cover the full rect only when their SHARED edge is a
@@ -87,9 +103,13 @@ enum : unsigned {
 //   const uint32_t* pal_mult() const;    // 256-entry vc-multiplied palette LUT
 //   void ensure_pal_mult(uint32_t vc);   // build the LUT for this vertex RGB
 //   uint32_t blend_px(uint32_t dst, uint32_t src) const;  // exact path blend
-template <class H>
-inline bool blit_quad_exec(H& st, const Vert* v, const TexView& t, float tsx, float tsy,
-                           bool strip) {
+//
+// The stage function carries the proofs + the paint; Paint==false (dry) runs
+// ONLY the proofs and returns true without touching the framebuffer — the
+// strip dispatcher proves every window before painting the first one.
+template <class H, bool Paint>
+inline bool blit_quad_stage(H& st, const Vert* v, const TexView& t, float tsx, float tsy,
+                            bool strip) {
     // Two texture classes take the fast path:
     //   bpp 1 (P_8)  — the paletted tile/sprite class; palette-index texels,
     //                  chroma punch, uniform-vc pal_mult LUT.
@@ -207,6 +227,8 @@ inline bool blit_quad_exec(H& st, const Vert* v, const TexView& t, float tsx, fl
             prev = cur;
         }
     }
+
+    if (!Paint) return true;      // dry: proofs passed, caller paints separately
 
     const uint32_t* pmult = st.pal_mult();
     const uint8_t*  hit   = st.chroma_hit();
@@ -371,6 +393,20 @@ inline bool blit_quad_exec(H& st, const Vert* v, const TexView& t, float tsx, fl
         }
     }
     return true;
+}
+
+// Paint path — the P13/P16 exec, byte-identical semantics.
+template <class H>
+inline bool blit_quad_exec(H& st, const Vert* v, const TexView& t, float tsx, float tsy,
+                           bool strip) {
+    return blit_quad_stage<H, true>(st, v, t, tsx, tsy, strip);
+}
+
+// Dry path — every proof, zero pixel writes (P17 strip pre-pass).
+template <class H>
+inline bool blit_quad_prove(H& st, const Vert* v, const TexView& t, float tsx, float tsy,
+                            bool strip) {
+    return blit_quad_stage<H, false>(st, v, t, tsx, tsy, strip);
 }
 
 } // namespace g3xbq
