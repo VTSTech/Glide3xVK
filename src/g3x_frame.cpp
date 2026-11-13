@@ -282,8 +282,6 @@ static unsigned s_n_vc0 = 0;          // P2.8: textured quads with (near-)unifor
                                       // BLACK vertex color — the shadow/darken
                                       // class; opaque-black rects unless chroma
                                       // punches their transparent texels
-static unsigned s_n_blit = 0;         // CPU-route perf: tile-class quads drawn
-                                      // through the blit_quad_exec fast path                                      
 
 // ---- raster ---------------------------------------------------------------
 struct RVert { float x, y, u, v; uint32_t argb; };
@@ -618,27 +616,6 @@ TexSpace tex_space(const RVert* /*v*/, unsigned /*n*/, const Tex& t) {
     return { sc, sc };
 }
 
-// P13 perf (CPU route): the tile-class quad blit. Axis-aligned, integer-corner,
-// 1:1-mapped P8 quads with uniform vertex color — the ground/wall/UI class the
-// field frame mixes are made of — rasterize through g3xrc::blit_quad_exec's
-// integer inner loop instead of two barycentric triangles (no per-pixel float
-// u/v walk, no per-pixel edge/weight work, blend class hoisted). Everything
-// the exec cannot PROVE pixel-identical (fractional corners, non-1:1 mapping,
-// per-pixel vertex color, clipping, duplicated corners, RGB565 video quads)
-// returns false and keeps the exact path; the 16-frame corpus hash pin gates
-// the equivalence. raster=gpu skips it (the kernel owns the stream).
-static bool quad_blit_fast(unsigned count, const RVert* v, float tsx, float tsy, bool strip) {
-    if (s_gpu_emit || count != 4 || s_cur < 0) return false;
-    const Tex& t = s_tex[s_cur];
-    if (g3xrc::blit_quad_exec(g3xrc_host(), v,
-                              g3xrc::TexView{ t.data, t.w, t.h, t.lod, t.bpp },
-                              tsx, tsy, strip)) {
-        ++s_n_blit;
-        return true;
-    }
-    return false;
-}
-
 // Field diagnostic (round 10): the first quads per distinct (dims) class,
 // with raw vertices + the applied square-space scale — verifies the P2.7
 // sampling rule directly in the field log without flooding. P2.8: the line
@@ -927,11 +904,11 @@ unsigned g3x_frame_tex_miss_count() {
     return s_tex_miss_total;
 }
 
-void g3x_frame_draw_stats(unsigned out[10]) {
+void g3x_frame_draw_stats(unsigned out[9]) {
     out[0] = s_n_vac; out[1] = s_n_parr; out[2] = s_n_parr_strip;
     out[3] = s_n_parr_fan; out[4] = s_n_skip_notex;
     out[5] = s_n_space256; out[6] = s_n_rgb565; out[7] = s_n_fill;
-    out[8] = s_n_vc0; out[9] = s_n_blit;
+    out[8] = s_n_vc0;
 }
 
 unsigned g3x_frame_chroma_toggles() {
@@ -983,7 +960,6 @@ void g3x_frame_draw_fan(unsigned count, const void* base, unsigned stride) {
                 verts[3].x, verts[3].y, verts[3].argb, verts[3].u, verts[3].v);
         ++s_dumped;
     }
-    if (quad_blit_fast(count, verts, tsx, tsy, false)) return;   // tile-class fast path    
     for (unsigned i = 1; i + 1 < count; ++i) {
         raster_tri(verts[0], verts[i], verts[i + 1], tsx, tsy);
     }
@@ -1026,8 +1002,6 @@ void g3x_frame_draw_pointers(unsigned mode, unsigned count, void* const* pointer
                 verts[0].argb, verts[1].argb, verts[2].argb, verts[3].argb);
         ++s_pdumped;
     }
-    if ((mode == G3X_GR_TRIANGLE_FAN || mode == G3X_GR_TRIANGLE_STRIP) &&
-        quad_blit_fast(count, verts, tsx, tsy, mode == G3X_GR_TRIANGLE_STRIP)) return;    
     if (mode == G3X_GR_TRIANGLE_FAN) {
         ++s_n_parr_fan;
         for (unsigned i = 1; i + 1 < count; ++i) {

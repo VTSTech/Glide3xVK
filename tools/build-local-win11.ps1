@@ -240,8 +240,6 @@ if (Test-Path $Strings) {
     $ver = (& $Strings $Dll | Select-String "^glide3xvk " | Select-Object -First 1)
     if ($ver) { Write-Ok "banner: $($ver.Line)" }
 }
-if (Test-Path $Spv) { Write-Ok ("routeb.comp.spv written ({0:N0} bytes)" -f (Get-Item $Spv).Length) }
-else { Write-Warning "routeb.comp.spv missing - raster=gpu will fail-soft to the CPU raster (see the glslang warning above)." }
 
 # ---------------------------------------------------------------------------
 # Artifact: stage\ + glide3x-dll-<id>.zip (CI's artifact equivalent)
