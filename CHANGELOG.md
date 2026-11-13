@@ -7,6 +7,106 @@ Format follows Keep a Changelog. Where a field round already ran, entries cite w
 glide3x.log showed on real hardware (RX 560, Vulkan 1.3, windowed). Commit refs are on
 branch `libslang-vk` of VTSTech/D2LoD-libslang-vk.
 
+## [0.4.8] - 2026-11-12 (Route B retired — the CPU raster is the route)
+
+### Removed
+
+- **The GPU (compute-shader) raster route — "Route B" — retired wholesale**
+  (~5,700 lines across 39 files, ea222d7): the experimental Vulkan
+  compute-raster backend (`g3x_raster_gpu.cpp/.h`, the shared
+  `g3x_raster_core.h`, the fxcap capture module `g3x_fxcap.cpp/.h`, the
+  whole `spike/` Route-B corpus — `routeb.comp`, the collector/pack/corpus
+  harnesses, `raster_regress.cpp`, the 15 MB `fxparity.cap` capture — and
+  `scripts/gen_raster_glsl.py` + `fxcap_scan.py`) is gone, together with the
+  draw-path hooks it needed in `glide_exports.cpp` / `g3x_frame.*` /
+  `vk_backend.*` / `g3x_slang.cpp`. The design record survives in
+  `docs/archive/ROUTE-B.md` (moved out of the repo root along with
+  `handoff.md`; `docs/CURRENT-STATUS.md` dropped with the same rollback). Rationale:
+  bring-up cost kept climbing while the P13 CPU fast path closed the same
+  gap, so the repo consolidates on the single CPU route — one rasterizer to
+  prove, one present path to tune. `README.md` rewritten around the current
+  architecture (aed4cc1); the CI workflow drops the GPU-raster stages
+  (2a96a20, d9d9df8).
+
+### Added
+
+- **P13: the tile-class quad blit fast path, restored** (new
+  `src/g3x_blit_quad.h`, dependency-free, + dispatcher wiring in
+  `g3x_frame.cpp`, 07ef466): axis-aligned, integer-corner, 1:1-mapped P8 /
+  RGB565 quads with uniform vertex color — the ground/wall/UI class the
+  field frame mixes are made of — rasterize through an integer inner loop
+  instead of two barycentric triangles (no per-pixel float u/v walk, no
+  edge/weight work, blend class hoisted to a switch outside the loop).
+  Everything the exec cannot PROVE pixel-identical — fractional corners,
+  non-1:1 texel slope, per-pixel vertex color, clipping, duplicated corners,
+  non-diagonal shared edge — returns false and keeps the exact
+  scanline/barycentric path; the two paths agree byte-for-byte on everything
+  the exec accepts. Field evidence (build 0.4.7-16): `blit=36/f` on the
+  tile quads with no visual change.
+- **Differential fuzz harness for the exec** (`scripts/fastpath_fuzz.cpp`,
+  07ef466): a verbatim port of the current `fill_span`/`raster_tri`/
+  `blend_px` semantics against a mock host, generating axis-aligned quads
+  over all lods (1x1 stress included), both texture classes, all five blend
+  classes, fan and strip triangulations, chroma on/off and wrap-around
+  sampling — and pins **fast == exact** on every case the exec accepts
+  (200k generated cases: 0 mismatches). This is the regression gate any
+  future fast-path extension must run.
+- **P14: staged present path** (`src/g3x_frame.cpp`, `src/vk_backend.cpp`,
+  ring landed a5dc647, Route-B hooks stripped out ea222d7; the staged
+  `gamma_scale_copy` compose path is 9a56d63): the present pass runs as a
+  **3-slot ring** — each slot
+  owns a command buffer, a fence, its acquire/render semaphore pair AND its
+  own host-visible upload staging, so the GPU copy of slot N reads slot N's
+  staging while the CPU composes frame N+1 (a shared staging would race).
+  `grBufferSwap` no longer fence-waits the frame it just submitted; the
+  wait moves to slot REUSE (up to 2 frames later), keeping the GPU serialize
+  outside the swap. The slang chain keeps its own fenced render and gains a
+  **staged feed at base_res 1x** (`g3x_slang_present` takes an optional
+  upload buffer; the chain copies the persistent staging into the input
+  image inside its own submit — no separate upload submit, no per-frame VMA
+  staging; base_res > 1 frames keep the classic feed, since there the
+  staging holds only the native frame). The compose gather additionally got
+  a staged `gamma_scale_copy` path with a host unit test
+  (`scripts/scalecopy_test.cpp`, 214 lines, pinned byte-equal).
+- **Vanilla+ hostver entries** (g3x_hostver.cpp): `Vanilla+0.0.7-R124`
+  (2fb2f3e), `Vanilla+0.0.8-R128` (06719b0), `Vanilla+0.0.8-R133`
+  (967a34d) — the overlay's exe line and the log name the running build
+  instead of `d2vp.exe [CRC ...]`.
+- **Windows 11 local build tooling** (`tools/build-local-win11.ps1` +
+  `.cmd`, d9d9df8): a full clean-build script (toolchain check, volk/
+  slang-vk fetch, 32-bit MSVC/Clang cross, DLL + fuzzer + scalecopy test)
+  so a field build no longer depends on the CI runner.
+
+### Changed
+
+- **P15 compiler flags** (CMakeLists.txt, 8294bd7): `-O3` for the wrapper
+  TUs (raster inner loops + present-path copies) and `-mtune=znver1` — the
+  field rig's RX Vega 11 is Raven Ridge (Zen 1), so this is instruction
+  selection/scheduling only, NO new ISA; the DLL stays runnable on any x86
+  (Picasso/Zen+ rigs would take `-mtune=znver2`). The measured flag round
+  (host suite: scalecopy compose + full fuzz; builds A `-O3 -msse2`,
+  B `+ -march=native`, C `+ -flto`: compose 1.10/1.10/1.08 ms, fuzz
+  8.91/8.86/8.93 s) killed `-march=native`/`-flto` as dead ends — the
+  compose gather is LUT/memory-bound scalar and the raster never
+  auto-vectorizes (per-pixel data-dependent branches; `-fopt-info-vec`
+  confirmed: 41 loops vectorized, all in test scaffolding). **Forbidden,
+  deliberately:** `-ffast-math` / `-funsafe-math-optimizations` — the P13
+  blit proof compares floats EXACTLY (`dudx*tsx == 1.0f`, boundary-clear
+  frac checks) and unsafe float math breaks the exec-vs-slow-path
+  byte-equality contract.
+- **CMake target set**: version stamp 0.4.8, host test targets for
+  `fastpath_fuzz` + `scalecopy_test`, and the `-Wl,-u` archive-member
+  forcing the def-file symbol lookup needs for the P13 exec's TU.
+
+### Validated
+
+- Field rounds (2026-11-12, RX Vega 11 rig, windowed 1080p desktop /
+  800x600 game): build 0.4.7-16 through 0.4.7-18 hold **avg ≈ 20-22 ms
+  swap-to-swap** (the game's own 25 Hz pacing dominates) with **work ≈
+  3.8-4.0 ms** inside the swap at ~860 draws/f, `blit=36/f`, texTable hwm
+  1862, no visual regressions against 0.4.7 — the frame mix, chroma fixes
+  and slang chain all behave identically with Route B's hooks gone.
+
 ## [0.4.7] - 2026-11-05
 
 ### Added
