@@ -5,7 +5,7 @@ A drop-in `glide3x.dll` replacement that renders Diablo II 1.14d through Vulkan 
 ## Status
 ✅ **Working**: Full Glide 3 API, Vulkan backend, CPU rasterizer, shader presets  
 ❌ **Removed**: GPU rasterizer (Route B) - removed for stability  
-📊 **Performance**: ~18 FPS at 1080p  
+📊 **Performance**: ~30 FPS at 1080p  
 🎮 **Tested**: Vanilla retail 1.14d installs with Vulkan GPUs
 
 ## Quick Start
