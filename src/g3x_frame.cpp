@@ -4,6 +4,7 @@
 #include "g3x_overlay.h"
 #include "g3x_slang.h"
 #include "g3x_shot.h"
+#include "g3x_blit_quad.h"
 
 #include <cstring>
 #include <cstdio>
@@ -282,6 +283,8 @@ static unsigned s_n_vc0 = 0;          // P2.8: textured quads with (near-)unifor
                                       // BLACK vertex color — the shadow/darken
                                       // class; opaque-black rects unless chroma
                                       // punches their transparent texels
+static unsigned s_n_blit = 0;         // P13 (restored): tile-class quads drawn
+                                      // through the g3x_blit_quad fast path
 
 // ---- raster ---------------------------------------------------------------
 struct RVert { float x, y, u, v; uint32_t argb; };
@@ -616,6 +619,62 @@ TexSpace tex_space(const RVert* /*v*/, unsigned /*n*/, const Tex& t) {
     return { sc, sc };
 }
 
+// P13 perf (restored 0.4.9): the tile-class quad blit. The Route-B rollback
+// took the g3xrc namespace (and this fast path) with it; the exec now lives
+// in g3x_blit_quad.h, dependency-free. Axis-aligned, integer-corner,
+// 1:1-mapped P8/RGB565 quads with uniform vertex color — the ground/wall/UI
+// class the field frame mixes are made of — rasterize through an integer
+// inner loop instead of two barycentric triangles (no per-pixel float u/v
+// walk, no per-pixel edge/weight work, blend class hoisted). Everything the
+// exec cannot PROVE pixel-identical (fractional corners, non-1:1 mapping,
+// per-pixel vertex color, clipping, duplicated corners) returns false and
+// keeps the exact path; scripts/fastpath_fuzz.cpp pins fast == exact.
+static_assert(sizeof(RVert) == sizeof(g3xbq::Vert) &&
+              offsetof(RVert, x) == offsetof(g3xbq::Vert, x) &&
+              offsetof(RVert, y) == offsetof(g3xbq::Vert, y) &&
+              offsetof(RVert, u) == offsetof(g3xbq::Vert, u) &&
+              offsetof(RVert, v) == offsetof(g3xbq::Vert, v) &&
+              offsetof(RVert, argb) == offsetof(g3xbq::Vert, argb),
+              "RVert must stay layout-identical to g3xbq::Vert");
+static_assert((unsigned)BC_OPAQUE == g3xbq::BQ_OPAQUE &&
+              (unsigned)BC_ADD    == g3xbq::BQ_ADD &&
+              (unsigned)BC_LERP   == g3xbq::BQ_LERP &&
+              (unsigned)BC_MUL    == g3xbq::BQ_MUL &&
+              (unsigned)BC_GEN    == g3xbq::BQ_GEN,
+              "BlendClass codes must match the blit header's BQ_* codes");
+
+// The Host adapter: exposes the frame module's statics under the blit
+// header's contract. Zero behavior — accessors only.
+struct FrameHost {
+    unsigned width() const        { return s_w; }
+    unsigned height() const       { return s_h; }
+    uint32_t* px() const          { return s_px; }
+    bool color_fill() const       { return s_color_fill; }
+    unsigned blend_class() const  { return (unsigned)s_blend_class; }
+    unsigned const_alpha() const  { return s_const_alpha; }
+    bool chroma_on() const        { return s_chroma_on; }
+    const uint8_t* chroma_hit() const { return s_chroma_hit; }
+    const uint32_t* pal_mult() const  { return s_pal_mult; }
+    void ensure_pal_mult(uint32_t vc) {
+        if (s_pal_mult_epoch != s_palette_epoch || s_pal_mult_vc != vc)
+            pal_mult_build(vc);
+    }
+    uint32_t blend_px(uint32_t dst, uint32_t src) const { return ::blend_px(dst, src); }
+};
+static FrameHost& blit_host() { static FrameHost h; return h; }
+
+static bool quad_blit_fast(unsigned count, const RVert* v, float tsx, float tsy, bool strip) {
+    if (count != 4 || s_cur < 0) return false;
+    const Tex& t = s_tex[s_cur];
+    if (g3xbq::blit_quad_exec(blit_host(), (const g3xbq::Vert*)v,
+                              g3xbq::TexView{ t.data, t.w, t.h, t.lod, t.bpp },
+                              tsx, tsy, strip)) {
+        ++s_n_blit;
+        return true;
+    }
+    return false;
+}
+
 // Field diagnostic (round 10): the first quads per distinct (dims) class,
 // with raw vertices + the applied square-space scale — verifies the P2.7
 // sampling rule directly in the field log without flooding. P2.8: the line
@@ -904,11 +963,11 @@ unsigned g3x_frame_tex_miss_count() {
     return s_tex_miss_total;
 }
 
-void g3x_frame_draw_stats(unsigned out[9]) {
+void g3x_frame_draw_stats(unsigned out[10]) {
     out[0] = s_n_vac; out[1] = s_n_parr; out[2] = s_n_parr_strip;
     out[3] = s_n_parr_fan; out[4] = s_n_skip_notex;
     out[5] = s_n_space256; out[6] = s_n_rgb565; out[7] = s_n_fill;
-    out[8] = s_n_vc0;
+    out[8] = s_n_vc0; out[9] = s_n_blit;
 }
 
 unsigned g3x_frame_chroma_toggles() {
@@ -960,6 +1019,7 @@ void g3x_frame_draw_fan(unsigned count, const void* base, unsigned stride) {
                 verts[3].x, verts[3].y, verts[3].argb, verts[3].u, verts[3].v);
         ++s_dumped;
     }
+    if (quad_blit_fast(count, verts, tsx, tsy, false)) return;   // P13: tile-class fast path
     for (unsigned i = 1; i + 1 < count; ++i) {
         raster_tri(verts[0], verts[i], verts[i + 1], tsx, tsy);
     }
@@ -1002,6 +1062,8 @@ void g3x_frame_draw_pointers(unsigned mode, unsigned count, void* const* pointer
                 verts[0].argb, verts[1].argb, verts[2].argb, verts[3].argb);
         ++s_pdumped;
     }
+    if ((mode == G3X_GR_TRIANGLE_FAN || mode == G3X_GR_TRIANGLE_STRIP) &&
+        quad_blit_fast(count, verts, tsx, tsy, mode == G3X_GR_TRIANGLE_STRIP)) return;
     if (mode == G3X_GR_TRIANGLE_FAN) {
         ++s_n_parr_fan;
         for (unsigned i = 1; i + 1 < count; ++i) {

@@ -258,7 +258,6 @@ if (-not $SkipZip) {
     $Stage = Join-Path $BuildDir "stage"
     New-Item -ItemType Directory -Force -Path $Stage | Out-Null
     Copy-Item $Dll $Stage -Force
-    if (Test-Path $Spv) { Copy-Item $Spv $Stage -Force }
     Get-ChildItem (Join-Path $RepoRoot "scripts") -Filter "*.cmd" | ForEach-Object {
         Copy-Item $_.FullName $Stage -Force
     }
