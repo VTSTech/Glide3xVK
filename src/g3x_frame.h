@@ -3,6 +3,8 @@
 // Owns the CPU "game framebuffer" that all Glide write paths converge on:
 //   - grBufferClear        -> g3x_frame_clear
 //   - grDrawVertexArrayContiguous -> g3x_frame_draw_fan (P_8 textured fan quads)
+//                            + g3x_frame_draw_points_array (P19: GR_POINTS —
+//                            the D2VP f2 batched light map, 18,432 dots/f)
 //   - grDrawVertexArray    -> g3x_frame_draw_pointers (ground/wall strips+fans:
 //                            D2Glide DrawGroundTile submits 5x mode-4 strips of
 //                            12 verts (or one mode-5 fan of 4 in low quality);
@@ -75,7 +77,7 @@ unsigned g3x_frame_chroma_toggles();
 // opaque-black rects unless chroma punches the transparent texels), and
 // tile-class quads through the P13 blit fast path (restored 0.4.9).
 // Feeds the periodic frame lines + shutdown summary (P2.4/P2.6/P2.7/P2.8).
-void     g3x_frame_draw_stats(unsigned out[10]);
+void     g3x_frame_draw_stats(unsigned out[11]);
 
 // TRIANGLE_FAN (mode 5): count vertices at `base`, `stride` bytes apart.
 void     g3x_frame_draw_fan(unsigned count, const void* base, unsigned stride);
@@ -89,6 +91,12 @@ void     g3x_frame_draw_pointers(unsigned mode, unsigned count, void* const* poi
 // Point = single rounded pixel; line = Bresenham with per-pixel frame clip.
 void     g3x_frame_draw_point(float x, float y);
 void     g3x_frame_draw_line(float x0, float y0, float x1, float y1);
+
+// P19: grDrawVertexArrayContiguous(GR_POINTS=0) — contiguous 0x1C-stride
+// vertex array, one rounded pixel per vertex, the vertex's OWN dwColor
+// (iterated color) through the current blend pair. The D2VP f2 batched light
+// map submits one 18,432-vertex array per frame.
+void     g3x_frame_draw_points_array(unsigned count, const void* base, unsigned stride);
 
 // Scale + gamma the frame into the swapchain and present. Also the Bink
 // unlock path (the video loop never calls grBufferSwap).

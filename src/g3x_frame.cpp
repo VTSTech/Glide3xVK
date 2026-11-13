@@ -285,6 +285,9 @@ static unsigned s_n_vc0 = 0;          // P2.8: textured quads with (near-)unifor
                                       // punches their transparent texels
 static unsigned s_n_blit = 0;         // P13 (restored): tile-class quads drawn
                                       // through the g3x_blit_quad fast path
+static unsigned s_n_array_points = 0; // P19: contiguous GR_POINTS vertices
+                                      // rasterized (the f2 batched light map
+                                      // submits 18,432 per frame when active)
 
 // ---- raster ---------------------------------------------------------------
 struct RVert { float x, y, u, v; uint32_t argb; };
@@ -998,11 +1001,11 @@ unsigned g3x_frame_tex_miss_count() {
     return s_tex_miss_total;
 }
 
-void g3x_frame_draw_stats(unsigned out[10]) {
+void g3x_frame_draw_stats(unsigned out[11]) {
     out[0] = s_n_vac; out[1] = s_n_parr; out[2] = s_n_parr_strip;
     out[3] = s_n_parr_fan; out[4] = s_n_skip_notex;
     out[5] = s_n_space256; out[6] = s_n_rgb565; out[7] = s_n_fill;
-    out[8] = s_n_vc0; out[9] = s_n_blit;
+    out[8] = s_n_vc0; out[9] = s_n_blit; out[10] = s_n_array_points;
 }
 
 unsigned g3x_frame_chroma_toggles() {
@@ -1097,10 +1100,37 @@ void g3x_frame_draw_pointers(unsigned mode, unsigned count, void* const* pointer
                 verts[0].argb, verts[1].argb, verts[2].argb, verts[3].argb);
         ++s_pdumped;
     }
-    if (mode == G3X_GR_TRIANGLE_FAN &&
-        quad_blit_fast(count, verts, tsx, tsy, false)) return;   // P13: 4-vert quads
-    if (mode == G3X_GR_TRIANGLE_STRIP &&
-        strip_blit_fast(count, verts, tsx, tsy)) return;         // P17: tile strips
+    const bool fan_blitted = (mode == G3X_GR_TRIANGLE_FAN) &&
+                             quad_blit_fast(count, verts, tsx, tsy, false);  // P13: 4-vert quads
+    if (fan_blitted) return;
+    const bool strip_blitted = (mode == G3X_GR_TRIANGLE_STRIP) &&
+                               strip_blit_fast(count, verts, tsx, tsy);      // P17: tile strips
+    if (strip_blitted) return;
+    // P18 field diagnostic: the vertex-array classes the blit proofs reject —
+    // the blit= counter held at ~36/f while strip+fan runs ~460 draws/f in the
+    // 0.4.7-20 log, so the big class rides the exact path on geometry the
+    // exec's proofs (bbox-corner rect, dyadic slopes) don't fit — suspected
+    // isometric ground/lightmap diamonds, but the parr dump only carried
+    // colors. These dumps pin the real (x,y|argb|s,t) contract from the field
+    // log: the first two rejected strips in FULL, and the first eight rejected
+    // 4-vertex fans (parr#1-3: mode=5 count=4, c=ff808080 — the lightmap
+    // candidates) vertex-by-vertex. Bounded, one-time per session.
+    static unsigned s_strdumped = 0;
+    if (mode == G3X_GR_TRIANGLE_STRIP && s_strdumped < 2) {
+        for (unsigned i = 0; i < count && i < 64; ++i)
+            g3x_log("striprej#%u (count=%u) v%02u: x%.1f y%.1f c%08x s%.2f t%.2f",
+                    s_strdumped + 1, count, i,
+                    verts[i].x, verts[i].y, verts[i].argb, verts[i].u, verts[i].v);
+        ++s_strdumped;
+    }
+    static unsigned s_fanrej = 0;
+    if (mode == G3X_GR_TRIANGLE_FAN && s_fanrej < 8) {
+        for (unsigned i = 0; i < count && i < 4; ++i)
+            g3x_log("fanrej#%u (count=%u) v%02u: x%.1f y%.1f c%08x s%.2f t%.2f",
+                    s_fanrej + 1, count, i,
+                    verts[i].x, verts[i].y, verts[i].argb, verts[i].u, verts[i].v);
+        ++s_fanrej;
+    }
     if (mode == G3X_GR_TRIANGLE_FAN) {
         ++s_n_parr_fan;
         for (unsigned i = 1; i + 1 < count; ++i) {
@@ -1137,6 +1167,40 @@ void g3x_frame_draw_point(float x, float y) {
     if (px < 0 || py < 0 || px >= (int)s_w || py >= (int)s_h) return;
     uint32_t* row = s_px + (size_t)py * s_w;
     row[px] = blend_px(row[px], const_fill_rgb());
+}
+
+// P19 (0.4.9): contiguous GR_POINTS vertex arrays — the D2VP f2 batched light
+// map. RENDERER_GLIDE_DrawLightMap (D2VP-QoL glide-perf f2) builds the fixed
+// 48x48 grid x 8 radial-offset point table once (18,432 vertices, stride
+// 0x1C), refreshes dwColor per frame and submits ONE
+// grDrawVertexArrayContiguous(GR_POINTS=0, 18432, ...) — replacing the retail
+// path's 20,736 wrapper calls per frame. Retail Glide rasterizes each vertex
+// as a 1-pixel dot in the ITERATED color: the vertex's own dwColor through
+// the blend pair active at the call site. This wrapper counted and logged
+// contiguous non-fan modes but never rasterized them — the whole radial-light
+// layer has been silently missing from the CPU route since the fork batched
+// this call (the f2 A/B gate comment anticipated exactly this failure:
+// "If the light map renders single-color or vanishes..."). Same semantics as
+// g3x_frame_draw_point, per-vertex: round-to-nearest pixel, in-frame guard,
+// blend through the CURRENT pair; the vertex's dwColor replaces the constant
+// fill — the combine at the lightmap call site is FUNCTION_LOCAL/ITERATED by
+// construction (grColorCombine(1,0,1,2,0)). The raw dwColor passes through
+// untouched: every blend lane reads RGB (and DST_ALPHA reads the DST byte),
+// so the source alpha byte is inert exactly as it is for the exact-path
+// blends — no per-vertex-alpha regression is possible from this path.
+// Rasterized points count into n_point (the periodic line's point= jumps to
+// ~18.4k/f when the light map flows — the field A/B signal for this patch).
+void g3x_frame_draw_points_array(unsigned count, const void* base, unsigned stride) {
+    if (!s_px || !base || !count) return;
+    for (unsigned i = 0; i < count; ++i) {
+        RVert v;
+        read_vert(v, (const uint8_t*)base + (size_t)i * stride);
+        const int px = (int)(v.x + 0.5f), py = (int)(v.y + 0.5f);
+        if (px < 0 || py < 0 || px >= (int)s_w || py >= (int)s_h) continue;
+        uint32_t* row = s_px + (size_t)py * s_w;
+        row[px] = blend_px(row[px], v.argb);
+        ++s_n_array_points;
+    }
 }
 
 void g3x_frame_draw_line(float x0, float y0, float x1, float y1) {
