@@ -152,7 +152,30 @@ target_link_options(glide3x PRIVATE
 # own flags.
 # CPU-route perf round 2: -O3 for our TUs (the raster inner loops + the
 # present-path copies; volk is flag-agnostic). SSE2 float math stays (P2.12).
-target_compile_options(glide3x PRIVATE -O3 -msse2 -mfpmath=sse -w)
+#
+# P15 flag round: measured on the host test suite (scalecopy_test compose
+# gather + fastpath_fuzz full run), three builds A=-O3 -msse2, B=+ -march=native,
+# C=+ -flto: compose 1.10/1.10/1.08 ms, fuzz 8.91/8.86/8.93 s — compiler flags
+# are a dead end for the remaining hot paths. The compose gather is
+# LUT/memory-bound scalar, and the raster never auto-vectorizes (per-pixel
+# data-dependent branches: chroma, texel fetch, blend — confirmed with
+# -fopt-info-vec: 41 loops vectorized, all in test scaffolding). So the only
+# remaining flag with real value is scheduling for the field rig:
+# -mtune=znver1 (RX Vega 11 = Raven Ridge = Zen 1) — instruction selection and
+# scheduling only, NO new ISA, the DLL stays runnable on any x86. If the field
+# CPU is a 3xxxFM/3x20G (Picasso, Zen+), -mtune=znver2 is the precise pick;
+# znver1 is close enough not to matter.
+#
+# Forbidden, deliberately:
+#   -ffast-math / -funsafe-math-optimizations — the P13 blit proof compares
+#     floats EXACTLY (dudx*tsx == 1.0f, boundary-clear frac checks); unsafe
+#     float math breaks the exec-vs-slow-path byte-equality contract.
+#   -flto — measured neutral, and it risks the def-file export machinery
+#     (the "_grBufferSwap@4" underscore hack above) for zero gain.
+#   PGO (-fprofile-generate/use) — the only technique with real headroom
+#     (10-20% typical), but the wrapper is already 3.8ms of a ~20ms field
+#     frame: even 20% is ~1ms, invisible next to the game's own 17ms loop.
+target_compile_options(glide3x PRIVATE -O3 -msse2 -mfpmath=sse -mtune=znver1 -w)
 
 set_source_files_properties(src/glide_exports.cpp PROPERTIES
     COMPILE_DEFINITIONS "G3XVK_BUILD_ID=\"${G3XVK_BUILD_ID}\"")
