@@ -32,6 +32,16 @@
 // scripts/fastpath_fuzz.cpp pins fast == exact against the CURRENT
 // fill_span/raster_tri semantics).
 //
+// P16 (0.4.9): the v axis relaxes from strict 1:1 to any exact power-of-two
+// texel step in [2^-6, 2^6] — the RGB565 light-map class (256x64 atlases
+// sampled 1:1 in u, 4x stretched in v) and vertical stretch/shrink UI quads.
+// A power-of-two step keeps every accumulated sample bit-exact, so the row
+// texel index is one exact float floor per row, and the boundary hazard
+// collapses to a frac-margin check over ONE period of the frac cycle (the
+// sequence is periodic with period 1/sy rows when sy < 1, constant when
+// sy >= 1). u stays strict 1:1 so the inner loop remains a pure integer
+// walk.
+//
 // `strip` selects the triangulation the dispatcher will run (fan:
 // (0,1,2)+(0,2,3), strip: (0,1,2)+(1,2,3) with per-tri winding normalize).
 // The two triangles cover the full rect only when their SHARED edge is a
@@ -44,6 +54,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cmath>
+#include <cstring>
 
 namespace g3xbq {
 
@@ -138,40 +149,60 @@ inline bool blit_quad_exec(H& st, const Vert* v, const TexView& t, float tsx, fl
     // (v0,v2), strip shares (v1,v2); otherwise their union is not the rect
     if (((strip ? cidx[1] ^ cidx[2] : cidx[0] ^ cidx[2]) & 3u) != 3u) return false;
 
-    // 1:1 texel slope, bit-exact (the whole point of the fast path)
+    // u texel slope bit-exactly +1.0 (the whole point of the fast path);
+    // v texel slope (P16): exact power of two in [2^-6, 2^6] — the 565
+    // light-map class is 1:1 in u but vertically stretched (a 256x64 atlas
+    // sampled over 64px rows gives dvdy*tsy == 0.25). A power-of-two step
+    // makes every accumulated sample EXACT (adding 2^-m to a float is exact
+    // at these magnitudes), so the per-row texel index is computed directly
+    // and the floor-boundary hazard reduces to a frac-margin check per
+    // distinct frac value: the frac sequence has period P = 1/sy rows (sy<1)
+    // or is constant (sy>=1), and one verified cycle proves every row.
     if (tsx <= 0.0f || tsy <= 0.0f) return false;
     const float dudx_u = (u_x1 - u_x0) / (float)(x1 - x0);
     const float dvdy_v = (v_y1 - v_y0) / (float)(y1 - y0);
-    if (dudx_u * tsx != 1.0f || dvdy_v * tsy != 1.0f) return false;
+    if (dudx_u * tsx != 1.0f) return false;
+    const float sy = dvdy_v * tsy;
+    uint32_t sy_bits;
+    std::memcpy(&sy_bits, &sy, sizeof(sy_bits));
+    if (sy_bits & 0x007FFFFFu) return false;                 // mantissa must be zero
+    if (sy_bits < 0x3B800000u || sy_bits > 0x43000000u) return false;  // 2^-6..2^6
 
     // first covered pixel's texel coordinate: center of the (u,x0+0.5) affine
     // and it must sit clear of the floor boundary (true 1:1 lands on frac 0.5)
     const float uf = (u_x0 + 0.5f * dudx_u) * tsx + 4096.0f;
-    const float vf = (v_y0 + 0.5f * dvdy_v) * tsy + 4096.0f;
     const float ufrac = uf - floorf(uf);
-    const float vfrac = vf - floorf(vf);
     if (ufrac < 1.0e-3f || ufrac > 1.0f - 1.0e-3f) return false;
-    if (vfrac < 1.0e-3f || vfrac > 1.0f - 1.0e-3f) return false;
 
     int tx0 = (int)uf - 4096;
-    int ty0 = (int)vf - 4096;
+
+    // v: first row-center sample, then the frac margin over one full period.
+    // Same margin rule as u: a sample within ~2 ulp of a texel boundary is
+    // rejected because the slow path derives v0 through different float ops
+    // (barycentric vs vertex-difference) and could legally floor either way.
+    const float vf0 = (v_y0 + 0.5f * dvdy_v) * tsy + 4096.0f;
+    {
+        unsigned period = 1;                       // sy >= 1: frac is constant
+        if (sy < 1.0f) period = (unsigned)(1.0f / sy + 0.5f);   // exact 2^m
+        if (period > (unsigned)(y1 - y0)) period = (unsigned)(y1 - y0);
+        for (unsigned j = 0; j < period; ++j) {
+            const float vr = vf0 + (float)j * sy;
+            const float fr = vr - floorf(vr);
+            if (fr < 1.0e-3f || fr > 1.0f - 1.0e-3f) return false;
+        }
+    }
 
     // verification walk: fill_span accumulates u += dudx per pixel; prove the
-    // accumulated floors advance by exactly +1 across the whole span
+    // accumulated floors advance by exactly +1 across the whole span (the v
+    // axis needs no walk — every row's sample is vf0 + j*sy with EXACT float
+    // arithmetic by the power-of-two step, and its frac margin was just
+    // verified over the full period).
     {
         float u = u_x0 + 0.5f * dudx_u;
         int prev = tx0;
         for (int k = 1; k < x1 - x0; ++k) {
             u += dudx_u;
             const int cur = (int)(u * tsx + 4096.0f) - 4096;
-            if (cur != prev + 1) return false;
-            prev = cur;
-        }
-        float vv = v_y0 + 0.5f * dvdy_v;
-        prev = ty0;
-        for (int k = 1; k < y1 - y0; ++k) {
-            vv += dvdy_v;
-            const int cur = (int)(vv * tsy + 4096.0f) - 4096;
             if (cur != prev + 1) return false;
             prev = cur;
         }
@@ -189,8 +220,9 @@ inline bool blit_quad_exec(H& st, const Vert* v, const TexView& t, float tsx, fl
     // texel-row stride in BYTES: P8 rows are tw bytes; RGB_565 rows are 2*tw
     // (fill_span indexes the 565 texel as tdata[2*(ty*tw+tx)], same stride).
     const size_t tstride = (size_t)tw * (pal8 ? 1u : 2u);
-    for (int y = y0; y < y1; ++y, ++ty0) {
-        const uint8_t* trow = tdata + (size_t)(ty0 & (int)thm) * tstride;
+    for (int y = y0; y < y1; ++y) {
+        const int ty = (int)(vf0 + (float)(y - y0) * sy) - 4096;
+        const uint8_t* trow = tdata + (size_t)(ty & (int)thm) * tstride;
         uint32_t* row = px + (size_t)y * w;   // row[x], x in [x0,x1) — same as fill_span
         if (!pal8) {
             // RGB_565 rows: texel = two bytes LE (fill_span bpp==2 verbatim),

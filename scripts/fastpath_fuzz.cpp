@@ -340,14 +340,35 @@ static void make_case(FuzzHost& h, g3xbq::Vert v[4], bool& strip, unsigned iter)
     h.pal_epoch = 0;
     h.ensure_pal_mult(vc);
 
-    // quad: axis-aligned integer, 1:1, in-frame; u/v spans 256 (full mip space)
+    // quad: axis-aligned integer, 1:1 in u; v per family — the P13 1:1 class
+    // plus the P16 v-stretch classes (texel step sy a power of two: 4x/2x/1x
+    // upscale, 2x/4x downscale), with occasional dyadic v0 bases (non-zero
+    // wrap offsets). Family 9 uses a NON-dyadic v0: the exec's exactness
+    // proofs require dyadic v coords, so those cases must be REJECTED (they
+    // skip the comparison) — their presence pins the reject guard.
     const unsigned qs = 1u << h.tlod;
-    if (qs + 2 > h.W || qs + 2 > h.H) { v[0].x = -1; return; }   // skip: won't fit
+    float vspan = 256.0f;
+    float vy0 = 0.0f;
+    unsigned qh = qs;                     // quad height in px
+    const unsigned fam = rndn(10);
+    if (fam >= 4) {                       // 6/10 v-stretch families
+        static const float sys[6] = { 0.25f, 0.5f, 2.0f, 4.0f, 0.125f, 1.0f };
+        const float sy = sys[fam - 4];
+        if (sy < 1.0f) qh = qs * 2;       // upscale needs a taller quad
+        if (qh + 2 > h.H || qs + 2 > h.W) { v[0].x = -1; return; }
+        vspan = sy * (float)qh * (256.0f / (float)qs);   // exact dyadic product
+        const unsigned off = rndn(4);
+        if (off == 0)      vy0 = 0.5f;                          // half-texel base
+        else if (off == 1) vy0 = (float)(1u << (h.tlod + 1));   // deeper wrap
+        else if (off == 2) vy0 = -128.0f;                       // negative base
+        else if (off == 3 && fam == 9) vy0 = 0.03f;             // non-dyadic: reject
+    }
+    if (qs + 2 > h.W || qh + 2 > h.H) { v[0].x = -1; return; }   // skip: won't fit
     const int x0 = 1 + (int)rndn(h.W - qs - 2);
-    const int y0 = 1 + (int)rndn(h.H - qs - 2);
+    const int y0 = 1 + (int)rndn(h.H - qh - 2);
     x0c = x0; y0c = y0;
     const int x1 = x0 + (int)qs;
-    const int y1 = y0 + (int)qs;
+    const int y1 = y0 + (int)qh;
     const uint32_t vcc = h.tbpp == 1 ? (vc | 0xFF000000u) : (uint32_t)rnd();
     const bool flip = rndn(2) == 0;
     unsigned vi[4][2];
@@ -356,7 +377,8 @@ static void make_case(FuzzHost& h, g3xbq::Vert v[4], bool& strip, unsigned iter)
     for (unsigned i = 0; i < 4; ++i) {
         const float px = vi[i][0] ? (float)x1 : (float)x0;
         const float py = vi[i][1] ? (float)y1 : (float)y0;
-        v[i] = { px, py, vi[i][0] ? 256.0f : 0.0f, vi[i][1] ? 256.0f : 0.0f, vcc };
+        v[i] = { px, py, vi[i][0] ? 256.0f : 0.0f,
+                 vi[i][1] ? vy0 + vspan : vy0, vcc };
     }
     if (h.tbpp == 2) v[1].argb = rnd();   // per-corner vc: 565 must ignore it
     strip = rndn(2) == 0;
