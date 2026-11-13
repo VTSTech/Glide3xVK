@@ -5,6 +5,7 @@
 #include "g3x_slang.h"
 #include "g3x_shot.h"
 #include "g3x_blit_quad.h"
+#include "g3x_blit_iso.h"
 
 #include <cstring>
 #include <cstdio>
@@ -285,6 +286,9 @@ static unsigned s_n_vc0 = 0;          // P2.8: textured quads with (near-)unifor
                                       // punches their transparent texels
 static unsigned s_n_blit = 0;         // P13 (restored): tile-class quads drawn
                                       // through the g3x_blit_quad fast path
+static unsigned s_n_iso = 0;          // P20: iso-lattice triangles drawn
+                                      // through the g3x_blit_iso fast path
+                                      // (ground grid tris + fan diamonds)
 static unsigned s_n_array_points = 0; // P19: contiguous GR_POINTS vertices
                                       // rasterized (the f2 batched light map
                                       // submits 18,432 per frame when active)
@@ -678,6 +682,30 @@ static bool quad_blit_fast(unsigned count, const RVert* v, float tsx, float tsy,
     return false;
 }
 
+// P20 perf: the iso-lattice triangle exec (g3x_blit_iso.h). Per-triangle
+// granularity — called first for every triangle the strip/fan exact loops
+// would feed raster_tri; anything the family proofs reject (non-integer
+// coords, other slopes, varying vc on P8, ...) falls back unchanged. The
+// observed ground/wall stream is made of this family: the f1 ground-grid
+// strips are ~50 slope-2 lattice tris per tile, the f5-style corner fans are
+// two lattice halves per diamond — the exec replaces their per-row edge
+// intersections + boundary fixup loops (up to 12 inside_exact calls per row)
+// with closed-form integer spans while keeping the attribute arithmetic
+// bit-identical (same wa/wb/wc expression text, same u/v accumulation).
+static bool iso_tri_fast(const RVert& a, const RVert& b, const RVert& c,
+                         float tsx, float tsy) {
+    if (s_cur < 0) return false;
+    const Tex& t = s_tex[s_cur];
+    if (g3xbi::blit_iso_exec(
+            blit_host(), *(const g3xbi::Vert*)&a, *(const g3xbi::Vert*)&b,
+            *(const g3xbi::Vert*)&c,
+            g3xbi::TexView{ t.data, t.w, t.h, t.lod, t.bpp }, tsx, tsy)) {
+        ++s_n_iso;
+        return true;
+    }
+    return false;
+}
+
 // P17 perf (0.4.9): multi-quad triangle strips. The field submits ground/wall
 // rows as G3X_GR_TRIANGLE_STRIP vertex arrays (parr#4: mode=4 count=40) —
 // quad_blit_fast's count==4 gate rejected the whole class (~128 draws/f in
@@ -1001,11 +1029,12 @@ unsigned g3x_frame_tex_miss_count() {
     return s_tex_miss_total;
 }
 
-void g3x_frame_draw_stats(unsigned out[11]) {
+void g3x_frame_draw_stats(unsigned out[12]) {
     out[0] = s_n_vac; out[1] = s_n_parr; out[2] = s_n_parr_strip;
     out[3] = s_n_parr_fan; out[4] = s_n_skip_notex;
     out[5] = s_n_space256; out[6] = s_n_rgb565; out[7] = s_n_fill;
     out[8] = s_n_vc0; out[9] = s_n_blit; out[10] = s_n_array_points;
+    out[11] = s_n_iso;
 }
 
 unsigned g3x_frame_chroma_toggles() {
@@ -1059,7 +1088,8 @@ void g3x_frame_draw_fan(unsigned count, const void* base, unsigned stride) {
     }
     if (quad_blit_fast(count, verts, tsx, tsy, false)) return;   // P13: tile-class fast path
     for (unsigned i = 1; i + 1 < count; ++i) {
-        raster_tri(verts[0], verts[i], verts[i + 1], tsx, tsy);
+        if (!iso_tri_fast(verts[0], verts[i], verts[i + 1], tsx, tsy))
+            raster_tri(verts[0], verts[i], verts[i + 1], tsx, tsy);
     }
 }
 
@@ -1134,7 +1164,8 @@ void g3x_frame_draw_pointers(unsigned mode, unsigned count, void* const* pointer
     if (mode == G3X_GR_TRIANGLE_FAN) {
         ++s_n_parr_fan;
         for (unsigned i = 1; i + 1 < count; ++i) {
-            raster_tri(verts[0], verts[i], verts[i + 1], tsx, tsy);
+            if (!iso_tri_fast(verts[0], verts[i], verts[i + 1], tsx, tsy))
+                raster_tri(verts[0], verts[i], verts[i + 1], tsx, tsy);
         }
     } else if (mode == G3X_GR_TRIANGLE_STRIP) {
         ++s_n_parr_strip;
@@ -1143,10 +1174,14 @@ void g3x_frame_draw_pointers(unsigned mode, unsigned count, void* const* pointer
         // edges between neighbours then fall on opposite directed edges, so
         // the top-left ownership rule still assigns each edge pixel exactly
         // once (no seams under opaque, no double-blend under additive).
+        // P20: iso_tri_fast normalizes winding itself, so the raw (a,b,c)
+        // goes to it first; the lattice family (the f1 ground grid) takes the
+        // closed-form span path, everything else falls back to raster_tri.
         for (unsigned i = 0; i + 2 < count; ++i) {
             const RVert& a = verts[i];
             const RVert& b = verts[i + 1];
             const RVert& c = verts[i + 2];
+            if (iso_tri_fast(a, b, c, tsx, tsy)) continue;
             const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
             if (area >= 0.0f) raster_tri(a, b, c, tsx, tsy);
             else              raster_tri(a, c, b, tsx, tsy);

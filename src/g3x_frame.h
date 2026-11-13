@@ -75,9 +75,11 @@ unsigned g3x_frame_chroma_toggles();
 // sub-256-mip draws, RGB565-texture draws, constant-fill quads (P2.7),
 // uniform-black-vertex textured quads (P2.8: the shadow/darken class —
 // opaque-black rects unless chroma punches the transparent texels), and
-// tile-class quads through the P13 blit fast path (restored 0.4.9).
+// tile-class quads through the P13 blit fast path (restored 0.4.9), and
+// iso-lattice triangles through the P20 blit fast path (ground grid + fan
+// diamonds).
 // Feeds the periodic frame lines + shutdown summary (P2.4/P2.6/P2.7/P2.8).
-void     g3x_frame_draw_stats(unsigned out[11]);
+void     g3x_frame_draw_stats(unsigned out[12]);
 
 // TRIANGLE_FAN (mode 5): count vertices at `base`, `stride` bytes apart.
 void     g3x_frame_draw_fan(unsigned count, const void* base, unsigned stride);

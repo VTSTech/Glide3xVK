@@ -38,6 +38,8 @@ struct G3xState {
     // counters
     uint32_t             n_draw_calls       = 0;
     uint32_t             n_tex_downloads    = 0;
+    uint32_t             n_texdl_bytes      = 0;   // P20: downloaded texture bytes
+                                                    // (floor-cache thrash probe)
     uint32_t             n_palette_downloads = 0;
     uint32_t             n_lfb_locks        = 0;
     uint32_t             n_swaps            = 0;

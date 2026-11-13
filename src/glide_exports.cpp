@@ -261,17 +261,19 @@ void __stdcall grBufferSwap(FxU32 swap_interval) {
     // tag budget-quiet, so these are the only evidence of what each phase
     // actually submitted (and how fast the CPU raster is keeping up).
     if (g_st.n_swaps % 120 == 0) {
-        unsigned ds[11];  // P2.8: 10 slots (vc0 + the restored P13 blit counter),
-                          // P19: +11 = contiguous GR_POINTS vertices (ptsarr=)
+        unsigned ds[12];  // P2.8: 10 slots (vc0 + the restored P13 blit counter),
+                          // P19: +11 = contiguous GR_POINTS vertices (ptsarr=),
+                          // P20: +12 = iso-lattice triangles (isot=)
         g3x_frame_draw_stats(ds);
         g3x_log("frame %u: avg=%.1fms work=%.1fms vac=%u parr=%u(strip=%u fan=%u) sub256=%u "
-                "rgb565=%u fill=%u vc0=%u blit=%u skip=%u point=%u ptsarr=%u texdl=%u "
-                "paldl=%u chm=%u lfb=%u",
+                "rgb565=%u fill=%u vc0=%u blit=%u skip=%u point=%u ptsarr=%u isot=%u "
+                "texdl=%u txb=%u paldl=%u chm=%u lfb=%u",
                 g_st.n_swaps, s_ms_n ? s_ms_acc / (double)s_ms_n : 0.0,
                 s_work_n ? s_work_acc / (double)s_work_n : 0.0,
                 ds[0], ds[1], ds[2], ds[3], ds[4], ds[5], ds[6], ds[7], ds[8], ds[9],
-                ds[10],
-                g_st.n_point, g_st.n_tex_downloads, g_st.n_palette_downloads,
+                ds[10], ds[11],
+                g_st.n_point, g_st.n_tex_downloads, g_st.n_texdl_bytes,
+                g_st.n_palette_downloads,
                 g3x_frame_chroma_toggles(), g_st.n_lfb_locks);
         s_ms_acc = 0.0; s_ms_n = 0;
         s_work_acc = 0.0; s_work_n = 0;
@@ -510,6 +512,26 @@ void __stdcall grTexDownloadMipMap(GrChipID_t tmu, FxU32 startAddress, FxU32 eve
                                    GrTexInfo* info) {
     ++g_st.n_tex_downloads;
     g3x_frame_tex_download(tmu, startAddress, info);   // P2.1: real upload (CPU copy)
+    // P20 texture-cache diagnostic: the 0.4.7-21 session shows texdl=63-73/f
+    // steady — the fork's glFloorCache/glSubtileCache/glTextureCache hierarchy
+    // re-downloads constantly. txb= (downloaded bytes) settles whether the
+    // floor cache is thrashing (25.6 KB/floor tile -> MBs/f) or the
+    // downloads are small wall subtiles (1 KB) as the player moves. The
+    // first 40 downloads log (tmu, addr, fmt, lods, bytes, txb) — address
+    // bands map 1:1 onto the fork's RENDERER_GLIDE_InitTextureMemory
+    // partitioning (debug font -> floor cache -> subtile cache -> sprite
+    // caches), so a thrashing band is visible in the addresses alone.
+    const FxU32 nbytes = grTexTextureMemRequired(evenOdd, info);
+    g_st.n_texdl_bytes += nbytes;
+    static unsigned s_txlog = 0;
+    if (s_txlog < 40) {
+        g3x_log("texdl#%u: tmu=%u addr=0x%08x fmt=%u lods %u..%u bytes=%u txb=%u",
+                s_txlog + 1, tmu, startAddress,
+                info ? info->format : 0,
+                info ? info->smallLodLog2 : 0, info ? info->largeLodLog2 : 0,
+                nbytes, g_st.n_texdl_bytes);
+        ++s_txlog;
+    }
     g3x_log_once("grTexDownloadMipMap", "tmu=%u addr=0x%08x fmt=%u lods %u..%u",
                  tmu, startAddress, info ? info->format : 0,
                  info ? info->smallLodLog2 : 0, info ? info->largeLodLog2 : 0);

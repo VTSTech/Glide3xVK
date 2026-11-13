@@ -16,6 +16,7 @@
 // Run:    /tmp/fastpath_fuzz [iterations]
 
 #include "../src/g3x_blit_quad.h"
+#include "../src/g3x_blit_iso.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -504,6 +505,165 @@ static int strip_round(unsigned iters) {
     return mism ? 1 : 0;
 }
 
+// ---- P20 iso-lattice round --------------------------------------------------
+// blit_iso_stage vs ref_raster_tri over the isometric lattice family the
+// 0.4.7-21 field log pinned: integer vertices, two slope-+-2 edges, one
+// axis-aligned edge (H: apex + horizontal base = the ground-grid triangles;
+// V: apex centered on a vertical edge = the corner-fan diamond halves). Both
+// orientations, all 6 vertex permutations (the exec classifies the
+// axis-aligned edge after winding normalize), clipped and off-frame
+// positions, random u/v (the exec inherits the exact path's float
+// accumulation, so no dyadic constraint), all 5 blend classes, both texture
+// formats, chroma on/off. Every 8th case is adversarial (non-integer coord,
+// broken slope, off-center apex, P8 varying vc) and MUST reject — an
+// accepted adversarial case compares against the exact path like any other,
+// so corruption still shows as a byte mismatch.
+static int iso_round(unsigned iters) {
+    FuzzHost h;
+    unsigned ran = 0, acc = 0, mism = 0, adv_n = 0;
+    for (unsigned it = 0; it < iters; ++it) {
+        h.W = 64 + rndn(193);
+        h.H = 64 + rndn(193);
+        h.buf.resize((size_t)h.W * h.H);
+        for (auto& p : h.buf) p = rnd() | 0xFF000000u;
+        switch (rndn(5)) {
+            case 0:  h.sf = 4; h.df = 0; h.bc = g3xbq::BQ_OPAQUE; break;
+            case 1:  h.sf = 4; h.df = 4; h.bc = g3xbq::BQ_ADD;    break;
+            case 2:  h.sf = 1; h.df = 5; h.bc = g3xbq::BQ_LERP;   break;
+            case 3:  h.sf = 0; h.df = 2; h.bc = g3xbq::BQ_MUL;    break;
+            default: h.sf = 2; h.df = 1; h.bc = g3xbq::BQ_GEN;    break;
+        }
+        h.const_alpha_v = (uint8_t)rnd();
+        h.color_fill_v = false;
+        h.tlod = rndn(9);
+        h.tw = 1u << h.tlod;
+        h.th = 1u << h.tlod;
+        h.tbpp = (it % 2) ? 2 : 1;
+        if (h.tbpp == 1) {
+            h.tex8.resize((size_t)h.tw * h.th);
+            for (auto& t : h.tex8) t = (uint8_t)rndn(256);
+        } else {
+            h.tex16.resize((size_t)h.tw * h.th * 2);
+            for (auto& t : h.tex16) t = (uint8_t)rndn(256);
+        }
+        h.chroma_on_v = rndn(2) == 0;
+        for (int i = 0; i < 256; ++i) h.hit[i] = 0;
+        if (h.chroma_on_v) {
+            h.hit[rndn(256)] = 1;
+            if (rndn(2)) h.hit[0] = 1;
+        }
+        const uint32_t vc = rnd() & 0x00FFFFFFu;
+        for (int i = 0; i < 256; ++i) h.pal[i] = rnd() | 0xFF000000u;
+        h.pal_epoch = 0;
+        h.ensure_pal_mult(vc);
+
+        // lattice triangle — apex at a random (possibly off-frame) position
+        const int d = 1 + (int)rndn(24);              // half-height in rows
+        const int ax = (int)rndn(h.W + 60) - 30;
+        const int ay = (int)rndn(h.H + 60) - 30;
+        const bool up = rndn(2) == 0;
+        const bool orient_h = rndn(2) == 0;           // H base / V vertical edge
+        const int by = up ? ay + d : ay - d;          // H: base row
+        const int vx = up ? ax + 2 * d : ax - 2 * d;  // V: vertical edge x
+        g3xbi::Vert t[3];
+        if (orient_h) {
+            t[0] = { (float)ax, (float)ay, 0, 0, vc };
+            t[1] = { (float)(ax - 2 * d), (float)by, 0, 0, vc };
+            t[2] = { (float)(ax + 2 * d), (float)by, 0, 0, vc };
+        } else {
+            t[0] = { (float)ax, (float)ay, 0, 0, vc };
+            t[1] = { (float)vx, (float)(ay - d), 0, 0, vc };
+            t[2] = { (float)vx, (float)(ay + d), 0, 0, vc };
+        }
+        // random u/v (any affine data works — the exec inherits the exact
+        // path's arithmetic), random vertex permutation
+        for (unsigned k = 0; k < 3; ++k) {
+            t[k].u = (float)((int)rndn(1400) - 200);
+            t[k].v = (float)((int)rndn(1400) - 200);
+        }
+        if (h.tbpp == 1) {
+            // P8 class paints through pal_mult: uniform vc required (the
+            // exec rejects varying vc; keep all three equal here — varying
+            // is covered by the adversarial slot below)
+            for (unsigned k = 0; k < 3; ++k) t[k].argb = vc;
+        } else {
+            for (unsigned k = 0; k < 3; ++k) t[k].argb = rnd() & 0xFFFFFFFFu;
+        }
+        const unsigned perm = rndn(6);
+        static const unsigned perms[6][3] = { {0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0} };
+        const g3xbi::Vert a = t[perms[perm][0]], b = t[perms[perm][1]], c = t[perms[perm][2]];
+
+        const bool adv = (it % 8) == 7;
+        g3xbi::Vert ma = a, mb = b, mc = c;
+        if (adv) {
+            ++adv_n;
+            switch (rndn(4)) {
+                case 0:  ma.x += 0.5f; break;                    // non-integer coord
+                case 1:  mb.x += 1.0f; break;                    // slope off the lattice
+                case 2:  ma.y += 1.0f; break;                    // V apex off center / H slope break
+                default: mb.argb = mc.argb = ma.argb ^ 0x00FFFFFFu; break;  // P8 varying vc
+            }
+        }
+        const float tsx = (float)(1u << h.tlod) / 256.0f;
+        const float tsy = tsx;
+
+        std::vector<uint32_t> fast = h.buf;
+        std::vector<uint32_t> slow = h.buf;
+        bool accepted;
+        {
+            struct FastHost : FuzzHost {
+                uint32_t* fast_px;
+                uint32_t* px() { return fast_px; }
+            } h2;
+            *static_cast<FuzzHost*>(&h2) = h;
+            h2.fast_px = fast.data();
+            accepted = g3xbi::blit_iso_exec(h2, ma, mb, mc,
+                g3xbi::TexView{ h.tbpp == 1 ? h.tex8.data() : h.tex16.data(),
+                                h.tw, h.th, h.tlod, h.tbpp },
+                tsx, tsy);
+        }
+        if (adv && !accepted) continue;               // rejected as required
+        if (!accepted) continue;                      // non-adv reject: skip
+        ++acc;
+        {
+            struct SlowHost : FuzzHost {
+                uint32_t* slow_px;
+                uint32_t* px() { return slow_px; }
+            } h3;
+            *static_cast<FuzzHost*>(&h3) = h;
+            h3.slow_px = slow.data();
+            ref_raster_tri(h3, {ma.x, ma.y, ma.u, ma.v, ma.argb},
+                              {mb.x, mb.y, mb.u, mb.v, mb.argb},
+                              {mc.x, mc.y, mc.u, mc.v, mc.argb}, tsx, tsy);
+        }
+        ++ran;
+        if (fast != slow) {
+            ++mism;
+            if (mism <= 2) {
+                std::printf("ISO MISMATCH iter=%u bpp=%u adv=%u sf=%u df=%u W=%u H=%u lod=%u "
+                            "tri=(%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f)\n",
+                            it, h.tbpp, (unsigned)adv, h.sf, h.df, h.W, h.H, h.tlod,
+                            ma.x, ma.y, mb.x, mb.y, mc.x, mc.y);
+                std::printf("   uv: a(%.2f,%.2f c%08x) b(%.2f,%.2f c%08x) c(%.2f,%.2f c%08x)\n",
+                            ma.u, ma.v, ma.argb, mb.u, mb.v, mb.argb, mc.u, mc.v, mc.argb);
+                int shown = 0;
+                for (size_t i = 0; i < fast.size() && shown < 6; ++i) {
+                    if (fast[i] != slow[i]) {
+                        std::printf("   (%3u,%3u) pre=%08x fast=%08x slow=%08x\n",
+                                    (unsigned)(i % h.W), (unsigned)(i / h.W),
+                                    h.buf[i], fast[i], slow[i]);
+                        ++shown;
+                    }
+                }
+            }
+            if (mism >= 2) break;
+        }
+    }
+    std::printf("iso round: ran=%u accepted=%u adversarial=%u mismatches=%u\n",
+                ran, acc, adv_n, mism);
+    return mism ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     const unsigned iters = (argc > 1) ? (unsigned)atoi(argv[1]) : 20000u;
     FuzzHost h;
@@ -603,5 +763,6 @@ int main(int argc, char** argv) {
     std::printf("lods: 0=%u 1=%u 2=%u 3=%u 4=%u 5=%u 6=%u 7=%u 8=%u\n",
                 lods[0], lods[1], lods[2], lods[3], lods[4], lods[5], lods[6], lods[7], lods[8]);
     const int strip_rc = strip_round(iters / 2);   // P17 strip-decomposition round
-    return (mism ? 1 : 0) | strip_rc;
+    const int iso_rc = iso_round(iters / 2);       // P20 iso-lattice round
+    return (mism ? 1 : 0) | strip_rc | iso_rc;
 }
