@@ -1134,6 +1134,54 @@ void g3x_frame_draw_line(float x0, float y0, float x1, float y1) {
 // the legacy and chain paths agree. The 1:1 fast path is untouched; the bar
 // fill is a few hundred KB of writes, noise next to the copy itself. Bars
 // are plain zero fill: alpha is don't-care for an opaque present buffer.
+// P14 (0.4.9): present-path scale maps. The compose loop below paid a
+// x*s_w/rw mul+div PER PIXEL (and per row for y) — at 800x600 -> 1440x1080
+// that is ~1.55M integer divisions per presented frame. The source indices
+// are a pure step function of the target size, so they hoist into cached
+// maps built with the SAME integer expressions — byte-identical output by
+// construction, rebuilt only when the source resolution or the compose
+// extent changes. The inner loop then turns into one uint32 gather per
+// pixel from a pre-gamma'd source row (each distinct source row
+// gamma-mapped once per run of destination rows that sample it, which is
+// the upscale case). Scope note: work= in the periodic frame line already
+// wraps this whole function (grBufferSwap -> g3x_frame_present), and the
+// field shows work=2.6ms there — the compose is the largest single slice
+// of it, not of avg (avg-40ms is the engine's own 25 Hz pacing gate, not
+// present cost). scripts/scalecopy_test.cpp pins byte-equality.
+static unsigned* s_scale_cmap = nullptr;      // [rw]   sx = x * s_w / rw
+static unsigned   s_scale_cmap_n = 0;
+static unsigned   s_scale_cmap_key_w = 0;     // source width the map was built for
+static unsigned* s_scale_rmap = nullptr;      // [rh]   sy = y * s_h / rh
+static unsigned   s_scale_rmap_n = 0;
+static unsigned   s_scale_rmap_key_h = 0;     // source height the map was built for
+static uint32_t*  s_scale_row = nullptr;      // [s_w]  pre-gamma'd BGRA source row
+static unsigned   s_scale_row_n = 0;
+
+static void scale_maps_ensure(unsigned rw, unsigned rh) {
+    if (!s_scale_cmap || s_scale_cmap_n != rw || s_scale_cmap_key_w != s_w) {
+        delete[] s_scale_cmap;
+        s_scale_cmap = new (std::nothrow) unsigned[rw];
+        if (!s_scale_cmap) { s_scale_cmap_n = 0; return; }
+        for (unsigned x = 0; x < rw; ++x) s_scale_cmap[x] = x * s_w / rw;
+        s_scale_cmap_n = rw;
+        s_scale_cmap_key_w = s_w;
+    }
+    if (!s_scale_rmap || s_scale_rmap_n != rh || s_scale_rmap_key_h != s_h) {
+        delete[] s_scale_rmap;
+        s_scale_rmap = new (std::nothrow) unsigned[rh];
+        if (!s_scale_rmap) { s_scale_rmap_n = 0; return; }
+        for (unsigned y = 0; y < rh; ++y) s_scale_rmap[y] = y * s_h / rh;
+        s_scale_rmap_n = rh;
+        s_scale_rmap_key_h = s_h;
+    }
+    if (!s_scale_row || s_scale_row_n != s_w) {
+        delete[] s_scale_row;
+        s_scale_row = new (std::nothrow) uint32_t[s_w];
+        if (!s_scale_row) { s_scale_row_n = 0; return; }
+        s_scale_row_n = s_w;
+    }
+}
+
 static void gamma_scale_copy(uint8_t* dst, unsigned dw, unsigned dh) {
     if (s_gamma_identity && dw == s_w && dh == s_h) {
         std::memcpy(dst, s_px, (size_t)s_w * s_h * 4);
@@ -1165,6 +1213,33 @@ static void gamma_scale_copy(uint8_t* dst, unsigned dw, unsigned dh) {
                             (size_t)(dw - ox - rw) * 4);
         }
     }
+    scale_maps_ensure(rw, rh);
+    if (s_scale_cmap && s_scale_rmap && s_scale_row) {
+        // P14 gather loop: one uint32 load + store per pixel, zero mul/div.
+        // Byte layout matches the old per-pixel writer exactly: little-endian
+        // uint32 = B | G<<8 | R<<16 | 0xFF000000.
+        uint8_t* d = dst + ((size_t)oy * dw + ox) * 4;
+        unsigned last_sy = 0xFFFFFFFFu;
+        for (unsigned y = 0; y < rh; ++y) {
+            const unsigned sy = s_scale_rmap[y];
+            if (sy != last_sy) {                    // gamma the source row once
+                const uint32_t* row = s_px + (size_t)sy * s_w;
+                for (unsigned x = 0; x < s_w; ++x) {
+                    const uint32_t p = row[x];
+                    s_scale_row[x] = 0xFF000000u
+                        | (uint32_t)s_gamma_lut[2][p & 0xFF]
+                        | ((uint32_t)s_gamma_lut[1][(p >> 8) & 0xFF] << 8)
+                        | ((uint32_t)s_gamma_lut[0][(p >> 16) & 0xFF] << 16);
+                }
+                last_sy = sy;
+            }
+            for (unsigned x = 0; x < rw; ++x, d += 4)
+                std::memcpy(d, s_scale_row + s_scale_cmap[x], 4);
+            d = dst + ((size_t)(oy + y + 1) * dw + ox) * 4;   // next row start
+        }
+        return;
+    }
+    // allocation failed (or maps empty): the old per-pixel loop, verbatim
     uint8_t* d = dst + ((size_t)oy * dw + ox) * 4;
     for (unsigned y = 0; y < rh; ++y) {
         const unsigned sy = y * s_h / rh;
