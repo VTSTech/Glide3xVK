@@ -66,7 +66,6 @@ Game.exe → glide3x.dll → CPU Rasterizer → Vulkan Swapchain
 
 - [FIELD-TEST.md](FIELD-TEST.md) - Field testing results
 - [BUILD-32BIT.md](BUILD-32BIT.md) - Build instructions
-- [docs/CURRENT-STATUS.md](docs/CURRENT-STATUS.md) - Current project status
 
 ## License
 

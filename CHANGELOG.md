@@ -3,9 +3,6 @@
 Notable changes to **glide3xvk** - the glide3x.dll Glide 3 -> Vulkan translation layer
 for Diablo II 1.14d (vanilla retail, `-w -3dfx`).
 
-Format follows Keep a Changelog. Where a field round already ran, entries cite what
-glide3x.log showed on real hardware (RX 560, Vulkan 1.3, windowed). Commit refs are on
-branch `libslang-vk` of VTSTech/D2LoD-libslang-vk.
 
 ## [0.4.8] - 2026-11-12 (Route B retired — the CPU raster is the route)
 
