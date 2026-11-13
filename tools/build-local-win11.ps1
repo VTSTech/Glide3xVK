@@ -57,7 +57,7 @@ param(
     [int]$Jobs = 0,
     # Do not produce the stage\ folder and glide3x-dll-<id>.zip artifact.
     [switch]$SkipZip,
-    # Copy glide3x.dll + routeb.comp.spv into this directory (a 1.14d install).
+    # Copy glide3x.dll into this directory (a 1.14d install).
     [string]$DeployTo = ""
 )
 
@@ -198,36 +198,6 @@ if ($Clean -and (Test-Path $BuildDir)) {
     Remove-Item $BuildDir -Recurse -Force
 }
 
-# ---------------------------------------------------------------------------
-# Route-B kernel: generated from g3x_raster_core.h, compiled to SPIR-V.
-# The DLL loads routeb.comp.spv from its own directory (fail-soft to the CPU
-# raster without it) - the artifact ships the EXACT kernel blob the CI
-# routeb job hash-verifies, never a stale copy.
-# ---------------------------------------------------------------------------
-$Spv = Join-Path $BuildDir "routeb.comp.spv"
-
-Write-Step "Kernel is generated from the core (structural single-source)"
-$py = (Get-Command python -ErrorAction SilentlyContinue).Source
-if (-not $py) { $py = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
-if ($py) {
-    & $py (Join-Path $RepoRoot "scripts\gen_raster_glsl.py") --check
-    if ($LASTEXITCODE -ne 0) { throw "spike/routeb.comp drifted from scripts/gen_raster_glsl.py - regenerate it, never hand-edit." }
-    Write-Ok "routeb.comp matches the generator"
-} else {
-    Write-Warning "python not on PATH - skipping the kernel generation check (CI gates it)"
-}
-
-if ($Glslang) {
-    Write-Step "Compiling the Route-B kernel to SPIR-V"
-    New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
-    & $Glslang -V (Join-Path $RepoRoot "spike\routeb.comp") -o $Spv
-    if ($LASTEXITCODE -ne 0) { throw "glslangValidator failed (exit $LASTEXITCODE)." }
-    Write-Ok ("routeb.comp.spv written ({0:N0} bytes)" -f (Get-Item $Spv).Length)
-} else {
-    Write-Warning "no glslangValidator found - routeb.comp.spv NOT compiled."
-    Write-Warning "raster=gpu fail-softs to the CPU raster without it. Copy the file"
-    Write-Warning "from a CI artifact zip (glide3x-dll-<sha>) into build-g3x\ after configure."
-}
 
 # ---------------------------------------------------------------------------
 # Configure + build
@@ -330,7 +300,6 @@ if ($DeployTo) {
 Write-Host ""
 Write-Step "Done"
 Write-Host "  build-g3x\glide3x.dll      the DLL - self-contained, drop-in by name"
-Write-Host "  build-g3x\routeb.comp.spv  the Route-B kernel - raster=gpu loads it from beside the DLL"
 if (-not $SkipZip) {
     Write-Host "  build-g3x\stage\           CI-artifact layout (DLL + kernel + scripts\*.cmd helpers)"
     Write-Host "  build-g3x\glide3x-dll-<id>.zip"
